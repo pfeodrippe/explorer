@@ -3,12 +3,14 @@
     <pane-query
       v-model:app_params="app_params"
       :conn="conn"
+      :query_result_state="queryResultState"
       v-if="app_params.sidebar">
     </pane-query>
 
     <pane-inspect
       :app_params="app_params"
       :conn="conn"
+      @result="onResult"
       @selectEntity="selectEntity">
     </pane-inspect>
 
@@ -38,6 +40,12 @@ const props = defineProps({
 
 const app_params = defineModel("app_params");
 const selectedEntity = ref();
+const queryResultState = ref({
+  seq: 0,
+  queryExpr: "",
+  useName: false,
+  value: {}
+});
 
 const css = computed(() => {
   let result = ["page-content"];
@@ -69,6 +77,10 @@ function onClose() {
 
 function onSelectEntity(path) {
   app_params.value.queries.path = path;
+}
+
+function onResult(resultState) {
+  queryResultState.value = resultState;
 }
 
 </script>

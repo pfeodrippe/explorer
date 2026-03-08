@@ -3,3 +3,4 @@
 .vscode
 gcov
 bin
+node_modules

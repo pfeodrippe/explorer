@@ -228,6 +228,7 @@ const PAGE_COMPONENTS = {
     'js/components/pages/queries/pane-inspect.vue',
     'js/components/pages/queries/query-editor.vue',
     'js/components/pages/queries/query-browser.vue',
+    'js/components/pages/queries/query-assistant.vue',
     'js/components/pages/queries/query-json.vue',
     'js/components/pages/queries/query-status.vue',
     'js/components/pages/queries/query-plan.vue',

@@ -81,6 +81,76 @@ docker run --name=explorer -p 80:80 --restart=unless-stopped -d sandermertens/fl
 
 You can now go to http://localhost to open the explorer.
 
+### AI Query Assistant
+The explorer includes an AI-assisted query builder in `Queries > Assistant`. It uses a small localhost bridge so the browser UI can:
+- inspect local AI provider status
+- start supported sign-in flows
+- store local API-key configuration
+- call local CLIs or direct APIs to generate Flecs queries
+
+#### 1. Install bridge dependencies
+From the explorer repository root:
+
+```bash
+npm install
+```
+
+#### 2. Start the localhost bridge
+From the explorer repository root:
+
+```bash
+npm run bridge
+```
+
+By default the bridge listens on `http://127.0.0.1:27891`.
+
+#### 3. Open the assistant
+- Open the explorer
+- Go to `Queries`
+- Select the `Assistant` tab
+- Leave the bridge URL as `http://127.0.0.1:27891` unless you changed it
+
+If you use the hosted explorer at `https://flecs.dev/explorer`, note that some browsers block a remote page from calling localhost. If that happens, host the explorer locally as described above.
+
+#### 4. Authenticate a provider
+The assistant supports multiple provider modes:
+
+**Claude CLI**
+- Use `Browser OAuth` to let the bridge start the local Claude browser sign-in flow and track completion
+- Or use `Launch Login` to open the native CLI login command in Terminal
+
+**Codex CLI**
+- Use `Browser OAuth` to start the Codex device/browser login flow and track completion
+- Or use `Launch Login` to open the native CLI login command in Terminal
+
+**OpenCode CLI**
+- Use `Launch Login`
+- Browser-managed OAuth is not exposed for OpenCode yet
+
+**OpenAI API**
+- Paste an API key
+- Enter a model name such as `gpt-5`
+- Click `Save`
+
+**Anthropic API**
+- Paste an API key
+- Enter a model name such as `claude-sonnet-4-5`
+- Click `Save`
+
+API-key configuration is stored locally by the bridge. The active config path is shown in the UI. By default it is stored in:
+
+```text
+~/.local/share/flecs-explorer/ai-bridge.json
+```
+
+#### 5. Generate a query
+- Select a ready provider
+- Describe the query you want in plain English
+- Click `Generate Query`
+- Use `Apply To Editor` to copy the generated Flecs query into the normal query field
+
+The assistant sends the current query, selected entity, current host, and sampled explorer symbols as context so the generated query can match the current session more accurately.
+
 ### Statistics
 The explorer can visualize statistics from Flecs applications. Statistics collection is disabled by default as it is not free. To enable it, import the `flecs.monitor` module:
 

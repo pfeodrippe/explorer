@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "description": "Flecs Explorer",
   "scripts": {
-    "test": "jest"
+    "test": "jest",
+    "bridge": "node tools/ai-bridge.js"
   },
   "dependencies": {
     "vue": "^3.4.0"

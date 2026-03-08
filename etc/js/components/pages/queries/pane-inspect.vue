@@ -56,8 +56,9 @@ const props = defineProps({
 const result = ref({reply: []});
 const request = ref(undefined);
 const queryTable = ref(null);
+const resultSeq = ref(0);
 
-const emit = defineEmits(["selectEntity"]);
+const emit = defineEmits(["selectEntity", "result"]);
 
 const query = computed(() => {
   return props.app_params.queries;
@@ -84,7 +85,7 @@ const doRequest = () => {
   }
 
   if (!q || !q.length) {
-    result.value = {};
+    publishResult({}, q);
     request.value = undefined;
   } else {
     request.value = query_func(q, {
@@ -99,13 +100,24 @@ const doRequest = () => {
         persist: true
       }, 
       (reply) => {
-        result.value = reply;
+        publishResult(reply, q);
       }, (reply) => {
-        result.value = reply;
+        publishResult(reply, q);
       }, () => {
-        result.value = []; // Aborted
+        publishResult([], q); // Aborted
       });
   }
+}
+
+function publishResult(nextResult, queryExpr) {
+  result.value = nextResult;
+  resultSeq.value += 1;
+  emit("result", {
+    seq: resultSeq.value,
+    queryExpr,
+    useName: query.value.use_name,
+    value: nextResult
+  });
 }
 
 const visibleClass = computed(() => {

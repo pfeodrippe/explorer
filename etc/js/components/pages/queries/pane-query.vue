@@ -1,6 +1,6 @@
 <template>
   <div id="pane-query" class="queries-left-pane pane">
-    <tabs :items="['editor', 'browse']"
+    <tabs :items="['editor', 'browse', 'assistant']"
         v-model:active_tab="app_params.queries.query_tab"
         class="explorer-tab-content"
         v-on:changed="onTab">
@@ -17,6 +17,18 @@
           v-model:query_kind="query.kind">
         </query-browser>
       </template>
+      <template v-slot:assistant>
+        <query-assistant
+          :conn="conn"
+          :host="app_params.host"
+          :query="query.expr"
+          :query_state="query"
+          :query_result_state="props.query_result_state"
+          @update:query="onUpdateQuery"
+          @run="onRunQuery"
+          @apply="onApplyQuery">
+        </query-assistant>
+      </template>
     </tabs>
   </div>
 </template>
@@ -29,17 +41,14 @@ export default { name: "pane-query" }
 import { defineProps, defineModel, computed } from 'vue';
 
 const props = defineProps({
-  conn: {type: Object, required: true}
+  conn: {type: Object, required: true},
+  query_result_state: {type: Object, required: false, default: () => ({ seq: 0, value: {} })}
 });
 
 const app_params = defineModel("app_params");
 
 const query = computed(() => {
   return app_params.value.queries;
-});
-
-const host = computed(() => {
-  return app_params.value.host;
 });
 
 const onTab = (evt) => {
@@ -49,6 +58,21 @@ const onTab = (evt) => {
   }
 
   query.value.use_name = isBrowse;
+}
+
+const onUpdateQuery = (value) => {
+  query.value.expr = value;
+}
+
+const onRunQuery = (value) => {
+  query.value.expr = value;
+  query.value.use_name = false;
+}
+
+const onApplyQuery = (value) => {
+  query.value.expr = value;
+  query.value.use_name = false;
+  app_params.value.queries.query_tab = "editor";
 }
 </script>
 
