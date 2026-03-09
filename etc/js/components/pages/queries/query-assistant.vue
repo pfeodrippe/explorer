@@ -40,10 +40,11 @@ npm run bridge</pre>
           id="assistant-prompt"
           v-model="prompt"
           rows="6"
-          placeholder="Examples: find all entities with Position and Velocity, show queries writing Position, find children of Player without Health">
+          placeholder="Examples: find all entities with Position and Velocity, show queries writing Position, find children of Player without Health"
+          @keydown.enter="handlePromptKeydown">
         </textarea>
         <div class="provider-help">
-          Context sent with the request includes the current query, the selected entity, the active host, and sampled component/query symbols when available.
+          Context sent with the request includes the current query, the selected entity, the active host, and sampled component/query symbols when available. Press Enter to submit (Shift+Enter for new line).
         </div>
 
         <div class="assistant-row assistant-row-generate">
@@ -175,6 +176,20 @@ npm run bridge</pre>
                 </button>
                 <button @click="refreshBridge">Refresh Status</button>
               </div>
+
+              <div v-if="selectedProvider.id === 'opencode-cli'" class="assistant-row assistant-row-model">
+                <label class="assistant-label" for="opencode-model">Model</label>
+                <select
+                  id="opencode-model"
+                  v-model="selectedOpencodeModel"
+                  @change="persistOpencodeModel"
+                  class="assistant-select">
+                  <option value="">Default</option>
+                  <option v-for="model in opencodeModels" :key="model.id" :value="model.id">
+                    {{ model.name }}
+                  </option>
+                </select>
+              </div>
             </template>
 
             <template v-else>
@@ -235,6 +250,8 @@ const emit = defineEmits(["update:query", "run", "apply"]);
 const BRIDGE_URL_KEY = "flecs.ai.bridgeUrl";
 const PROVIDER_ID_KEY = "flecs.ai.providerId";
 const AUTO_RUN_KEY = "flecs.ai.autoRun";
+const CONVERSATION_KEY = "flecs.ai.conversation";
+const OPENCODE_MODEL_KEY = "flecs.ai.opencodeModel";
 const DEFAULT_BRIDGE_URL = "http://127.0.0.1:27891";
 const MAX_AGENT_ATTEMPTS = 4;
 
@@ -251,7 +268,18 @@ const result = ref(undefined);
 const errorMessage = ref("");
 const authSession = ref(undefined);
 const autoRun = ref(localStorage.getItem(AUTO_RUN_KEY) !== "false");
-const conversation = ref([]);
+
+let savedConversation = [];
+try {
+  const saved = localStorage.getItem(CONVERSATION_KEY);
+  if (saved) {
+    savedConversation = JSON.parse(saved);
+  }
+} catch (error) {
+  // Ignore parse errors
+}
+
+const conversation = ref(savedConversation);
 const agentRunning = ref(false);
 const agentStopRequested = ref(false);
 const agentStatusMessage = ref("");
@@ -260,6 +288,8 @@ const awaitingExecution = ref(undefined);
 const apiKey = ref("");
 const apiModel = ref("");
 const knownSymbols = ref([]);
+const opencodeModels = ref([]);
+const selectedOpencodeModel = ref(localStorage.getItem("flecs.ai.opencodeModel") || "");
 let authSessionPollTimer = 0;
 let messageId = 0;
 let generationController = undefined;
@@ -370,6 +400,22 @@ function persistAutoRun() {
   localStorage.setItem(AUTO_RUN_KEY, autoRun.value ? "true" : "false");
 }
 
+function persistConversation() {
+  try {
+    localStorage.setItem(CONVERSATION_KEY, JSON.stringify(conversation.value));
+  } catch (error) {
+    // Ignore storage errors
+  }
+}
+
+function persistOpencodeModel() {
+  if (selectedOpencodeModel.value) {
+    localStorage.setItem(OPENCODE_MODEL_KEY, selectedOpencodeModel.value);
+  } else {
+    localStorage.removeItem(OPENCODE_MODEL_KEY);
+  }
+}
+
 function appendConversation(role, content, extras = {}) {
   conversation.value = [
     ...conversation.value,
@@ -380,11 +426,14 @@ function appendConversation(role, content, extras = {}) {
       ...extras
     }
   ].filter((message) => message.content).slice(-16);
+  
+  persistConversation();
 }
 
 function clearConversation() {
   conversation.value = [];
   agentStatusMessage.value = "";
+  localStorage.removeItem(CONVERSATION_KEY);
   agentAttempt.value = 0;
   agentStopRequested.value = false;
 }
@@ -486,22 +535,29 @@ async function requestAgentQuery(executionFeedback) {
   generationController = new AbortController();
 
   try {
+    const requestBody = {
+      providerId: selectedProvider.value.id,
+      prompt: prompt.value,
+      currentQuery: props.query,
+      selectedEntity: props.query_state.path,
+      host: props.host,
+      knownSymbols: knownSymbols.value,
+      conversation: conversation.value.map((message) => ({
+        role: message.role,
+        content: message.content
+      })),
+      executionFeedback
+    };
+
+    // Add model for OpenCode CLI
+    if (selectedProvider.value.id === "opencode-cli" && selectedOpencodeModel.value) {
+      requestBody.model = selectedOpencodeModel.value;
+    }
+
     const nextResult = await bridgeRequest("/v1/generate-query", {
       method: "POST",
       signal: generationController.signal,
-      body: JSON.stringify({
-        providerId: selectedProvider.value.id,
-        prompt: prompt.value,
-        currentQuery: props.query,
-        selectedEntity: props.query_state.path,
-        host: props.host,
-        knownSymbols: knownSymbols.value,
-        conversation: conversation.value.map((message) => ({
-          role: message.role,
-          content: message.content
-        })),
-        executionFeedback
-      })
+      body: JSON.stringify(requestBody)
     });
 
     result.value = nextResult;
@@ -555,6 +611,11 @@ async function refreshBridge() {
         providers.value[0];
       selectedProviderId.value = preferred.id;
     }
+
+    // Load OpenCode models if OpenCode CLI is selected
+    if (selectedProvider.value && selectedProvider.value.id === "opencode-cli") {
+      await loadOpencodeModels();
+    }
   } catch (error) {
     bridgeHealthy.value = false;
     providers.value = [];
@@ -562,6 +623,15 @@ async function refreshBridge() {
     errorMessage.value = String(error.message || error);
   } finally {
     bridgeLoading.value = false;
+  }
+}
+
+async function loadOpencodeModels() {
+  try {
+    const reply = await bridgeRequest("/v1/opencode/models");
+    opencodeModels.value = reply.models || [];
+  } catch (error) {
+    opencodeModels.value = [];
   }
 }
 
@@ -793,6 +863,15 @@ function runResult() {
 
   agentStatusMessage.value = "Running generated query in explorer.";
   emit("run", result.value.query);
+}
+
+function handlePromptKeydown(event) {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    if (canGenerate.value && !generateLoading.value) {
+      generateQuery();
+    }
+  }
 }
 
 function applyResult() {
@@ -1175,6 +1254,21 @@ ul.assistant-warnings {
   margin: 0.5rem 0 0.8rem 1rem;
   padding: 0;
   color: #ffcf8b;
+}
+
+div.assistant-row-model {
+  margin-top: 0.75rem;
+  align-items: center;
+}
+
+select.assistant-select {
+  flex: 1;
+  padding: 0.55rem 0.7rem;
+  border-radius: var(--border-radius-medium);
+  background-color: var(--bg-pane);
+  color: var(--primary-text);
+  border: none;
+  font-size: 0.9rem;
 }
 
 @media screen and (max-width: 800px) {

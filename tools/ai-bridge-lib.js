@@ -4,6 +4,7 @@ const path = require("path");
 
 const ANSI_ESCAPE_RE = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
 const MAX_CONTEXT_SYMBOLS = 80;
+const MAX_TOOL_RESULTS = 8;
 const FLECS_QUERY_DOCS = [
   "https://www.flecs.dev/flecs/md_docs_2FlecsQueryLanguage.html",
   "https://www.flecs.dev/flecs/md_docs_2Queries.html",
@@ -44,6 +45,100 @@ const FLECS_QUERY_EXAMPLES = [
     query: "TimeOfDay($)"
   }
 ];
+
+const QUERY_TOOLS = [
+  {
+    name: "list_entities",
+    description: "List all available Flecs entities and components. Use this when you need to see all available symbols.",
+    input_schema: {
+      type: "object",
+      properties: {},
+      required: []
+    }
+  },
+  {
+    name: "search_entities",
+    description: "Search for entities/components by name using a regex pattern. Use this when you need to find symbols matching a specific pattern (e.g., when you get a component error and need to find the correct name).",
+    input_schema: {
+      type: "object",
+      properties: {
+        pattern: {
+          type: "string",
+          description: "Regex pattern to match entity/component names (e.g., 'Position.*', '.*Velocity.*', '^flecs\\.core\\..*')"
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of results to return (default: 20)",
+          default: 20
+        }
+      },
+      required: ["pattern"]
+    }
+  }
+];
+
+function getToolDefinitions() {
+  return QUERY_TOOLS;
+}
+
+function executeToolCall(toolName, toolInput, context) {
+  if (toolName === "list_entities") {
+    const symbols = context.knownSymbols || [];
+    if (symbols.length === 0) {
+      return {
+        ok: true,
+        result: "No entities or components are available in the current session."
+      };
+    }
+
+    const formatted = symbols.slice(0, MAX_CONTEXT_SYMBOLS).map((symbol) => `  - ${symbol}`);
+    return {
+      ok: true,
+      result: `Available entities and components:\n${formatted.join("\n")}\n\nTotal: ${symbols.length} symbol${symbols.length === 1 ? "" : "s"}.`
+    };
+  }
+
+  if (toolName === "search_entities") {
+    const symbols = context.knownSymbols || [];
+    const pattern = toolInput.pattern;
+    const limit = toolInput.limit || 20;
+
+    if (!pattern) {
+      return {
+        ok: false,
+        error: "Pattern is required for search_entities"
+      };
+    }
+
+    try {
+      const regex = new RegExp(pattern, "i"); // Case-insensitive search
+      const matches = symbols.filter(symbol => regex.test(symbol)).slice(0, limit);
+      
+      if (matches.length === 0) {
+        return {
+          ok: true,
+          result: `No entities or components found matching pattern: ${pattern}`
+        };
+      }
+
+      const formatted = matches.map((symbol, index) => `  ${index + 1}. ${symbol}`);
+      return {
+        ok: true,
+        result: `Found ${matches.length} symbol(s) matching "${pattern}":\n${formatted.join("\n")}`
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: `Invalid regex pattern: ${error.message}`
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    error: `Unknown tool: ${toolName}`
+  };
+}
 
 const QUERY_RESULT_SCHEMA = {
   type: "object",
@@ -228,7 +323,8 @@ function buildQueryPrompt({
     "You may receive explorer execution feedback from earlier attempts. When that feedback shows a parser, identifier or semantic error, fix the query instead of repeating the failing query.",
     "When choosing identifiers, prefer exact names from the provided known symbol list and treat explorer error messages as authoritative feedback.",
     "If a request is ambiguous, prefer the most likely valid query and explain the uncertainty in warnings.",
-    "If information is missing, return the best query you can and explain uncertainty in warnings."
+    "If information is missing, return the best query you can and explain uncertainty in warnings.",
+    "You have access to tools: list_entities (returns all available entities/components) and search_entities (searches entities/components by regex pattern). Use these tools when you need to discover what entities/components exist or when you need to find the correct name for a component after getting an error."
   ].join(" ");
 
   const parts = [
@@ -436,13 +532,16 @@ function findStringWithJson(value) {
 
 module.exports = {
   QUERY_RESULT_SCHEMA,
+  QUERY_TOOLS,
   buildQueryPrompt,
   defaultBridgeConfig,
+  executeToolCall,
   extractDeviceCode,
   extractFirstJsonObject,
   extractFirstUrl,
   findStringWithJson,
   getBridgeConfigPath,
+  getToolDefinitions,
   loadBridgeConfig,
   normalizeQueryResponse,
   parseClaudeStatus,

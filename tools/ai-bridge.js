@@ -9,11 +9,13 @@ const { execFile, spawn, spawnSync } = require("child_process");
 
 const {
   buildQueryPrompt,
+  executeToolCall,
   extractDeviceCode,
   extractFirstJsonObject,
   extractFirstUrl,
   findStringWithJson,
   getBridgeConfigPath,
+  getToolDefinitions,
   loadBridgeConfig,
   normalizeQueryResponse,
   parseClaudeStatus,
@@ -30,7 +32,38 @@ const AUTH_SESSION_POLL_MS = 1500;
 const AUTH_SESSION_TIMEOUT_MS = 3 * 60 * 1000;
 const AUTH_SESSION_RETENTION_MS = 10 * 60 * 1000;
 const AUTH_SESSION_OUTPUT_LIMIT = 2400;
+const MAX_TOOL_RESULTS = 8;
 const AUTH_SESSIONS = new Map();
+const OPENCODE_SESSION_CACHE = new Map();
+const DEBUG_LOGS = [];
+const MAX_DEBUG_LOGS = 100;
+
+function debugLog(level, message, data = null) {
+  const timestamp = new Date().toISOString();
+  const entry = { timestamp, level, message, data };
+  
+  DEBUG_LOGS.push(entry);
+  if (DEBUG_LOGS.length > MAX_DEBUG_LOGS) {
+    DEBUG_LOGS.shift();
+  }
+  
+  // Also log to console
+  const prefix = `[${timestamp}] [${level.toUpperCase()}]`;
+  if (data) {
+    console.log(prefix, message, typeof data === 'object' ? JSON.stringify(data, null, 2) : data);
+  } else {
+    console.log(prefix, message);
+  }
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
 
 const PROVIDERS = {
   "claude-cli": {
@@ -666,129 +699,165 @@ async function startBrowserOauth(providerId) {
   return serializeAuthSession(session);
 }
 
-async function generateViaClaude(promptBundle) {
-  const fullPrompt = `${promptBundle.system}\n\n${promptBundle.user}`;
-  const result = await runCommand("claude", [
-    "-p",
-    "--tools",
-    "",
-    "--json-schema",
-    JSON.stringify({
-      type: "object",
-      additionalProperties: false,
-      required: ["query", "reasoning", "warnings"],
-      properties: {
-        query: { type: "string" },
-        reasoning: { type: "string" },
-        warnings: {
-          type: "array",
-          items: { type: "string" }
+function extractToolCallsFromResponse(rawOutput) {
+  const text = stripAnsi(rawOutput);
+  const toolCalls = [];
+
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && parsed.tool_use) {
+      toolCalls.push(...(Array.isArray(parsed.tool_use) ? parsed.tool_use : [parsed.tool_use]));
+    }
+  } catch (error) {
+    // Try to find tool calls in the text
+    const toolUseMatch = text.match(/"tool_use"\s*:\s*\[/);
+    if (toolUseMatch) {
+      try {
+        const jsonMatch = text.slice(toolUseMatch.index).match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          if (parsed && parsed.tool_use) {
+            toolCalls.push(...(Array.isArray(parsed.tool_use) ? parsed.tool_use : [parsed.tool_use]));
+          }
         }
-      }
-    }),
-    fullPrompt
-  ], {
-    timeout: 120000
-  });
-
-  if (!result.ok) {
-    throw new Error(summarizeError("Claude query generation failed", result));
-  }
-
-  return normalizeQueryResponse(extractFirstJsonObject(result.stdout));
-}
-
-async function generateViaCodex(promptBundle, model, cwd) {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "flecs-query-codex-"));
-  const schemaPath = path.join(tempDir, "schema.json");
-  const outputPath = path.join(tempDir, "output.json");
-  const fullPrompt = `${promptBundle.system}\n\n${promptBundle.user}`;
-
-  fs.writeFileSync(schemaPath, JSON.stringify({
-    type: "object",
-    additionalProperties: false,
-    required: ["query", "reasoning", "warnings"],
-    properties: {
-      query: { type: "string" },
-      reasoning: { type: "string" },
-      warnings: {
-        type: "array",
-        items: { type: "string" }
+      } catch (e) {
+        // Ignore parse errors
       }
     }
-  }));
-
-  const args = ["--ask-for-approval", "never"];
-  if (model) {
-    args.push("--model", model);
   }
 
-  args.push(
-    "exec",
-    "--skip-git-repo-check",
-    "-C", cwd || process.cwd(),
-    "--sandbox", "read-only",
-    "--output-schema", schemaPath,
-    "-o", outputPath,
-    fullPrompt
-  );
-
-  const result = await runCommand("codex", args, {
-    timeout: 120000
-  });
-
-  let payload = "";
-  if (fs.existsSync(outputPath)) {
-    payload = fs.readFileSync(outputPath, "utf8");
-  }
-
-  fs.rmSync(tempDir, { recursive: true, force: true });
-
-  if (!payload && !result.ok) {
-    throw new Error(summarizeError("Codex query generation failed", result));
-  }
-
-  return normalizeQueryResponse(extractFirstJsonObject(payload || result.stdout));
+  return toolCalls;
 }
 
-async function generateViaOpencode(promptBundle, model, cwd) {
-  const fullPrompt = `${promptBundle.system}\n\n${promptBundle.user}`;
-  const args = ["run", "--format", "json"];
-
-  if (model) {
-    args.push("--model", model);
-  }
-
-  if (cwd) {
-    args.push("--dir", cwd);
-  }
-
-  args.push(fullPrompt);
-
-  const result = await runCommand("opencode", args, {
-    timeout: 120000
+async function generateViaOpencode(promptBundle, model, cwd, context) {
+  const OPENCODE_SERVER = process.env.OPENCODE_SERVER_URL || "http://127.0.0.1:4096";
+  
+  debugLog("info", "Starting OpenCode generation", { 
+    server: OPENCODE_SERVER, 
+    model: model || "default",
+    symbolsCount: (context.knownSymbols || []).length 
   });
-
-  if (!result.ok) {
-    throw new Error(summarizeError("OpenCode query generation failed", result));
+  
+  async function createNewSession() {
+    debugLog("info", "Creating new OpenCode session");
+    const sessionResponse = await fetchJson(`${OPENCODE_SERVER}/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+    
+    const sessionID = sessionResponse.id;
+    OPENCODE_SESSION_CACHE.set(OPENCODE_SERVER, sessionID);
+    debugLog("info", "OpenCode session created", { sessionID });
+    return sessionID;
   }
-
-  const raw = stripAnsi(result.stdout);
-  const lines = raw.split("\n").map((line) => line.trim()).filter(Boolean);
-
-  for (const line of lines) {
+  
+  // Reuse or create session (cache by server URL)
+  let sessionID = OPENCODE_SESSION_CACHE.get(OPENCODE_SERVER);
+  
+  if (!sessionID) {
+    debugLog("info", "No cached session, creating new one");
+    sessionID = await createNewSession();
+  } else {
+    debugLog("info", "Using cached session", { sessionID });
+  }
+  
+  // Prepare the message
+  const fullPrompt = `${promptBundle.system}\n\n${promptBundle.user}\n\nAvailable components: ${(context.knownSymbols || []).slice(0, 20).join(", ")}`;
+  const promptLength = fullPrompt.length;
+  
+  debugLog("info", "Sending message to OpenCode", { 
+    sessionID, 
+    promptLength,
+    userPrompt: promptBundle.user 
+  });
+  
+  // Send message and wait for response
+  try {
+    const startTime = Date.now();
+    const messageResponse = await fetchJson(`${OPENCODE_SERVER}/session/${sessionID}/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        parts: [{ type: "text", text: fullPrompt }]
+      })
+    });
+    const elapsed = Date.now() - startTime;
+    
+    debugLog("info", "OpenCode response received", { 
+      elapsed: `${elapsed}ms`,
+      partsCount: (messageResponse.parts || []).length 
+    });
+    
+    // Extract text from response parts
+    const textParts = (messageResponse.parts || [])
+      .filter(part => part && part.type === "text")
+      .map(part => part.text)
+      .join("\n");
+    
+    debugLog("debug", "Response text extracted", { 
+      textLength: textParts.length,
+      preview: textParts.substring(0, 200)
+    });
+    
+    // Try to parse as JSON
     try {
-      const parsed = JSON.parse(line);
-      const candidate = findStringWithJson(parsed);
-      if (candidate) {
-        return normalizeQueryResponse(extractFirstJsonObject(candidate));
-      }
+      const parsed = normalizeQueryResponse(extractFirstJsonObject(textParts));
+      debugLog("info", "Successfully parsed response", { query: parsed.query });
+      return parsed;
     } catch (error) {
-      // Ignore non-JSON lines.
+      debugLog("warn", "Failed to parse JSON, using raw text", { error: error.message });
+      return {
+        query: textParts.trim().split("\n")[0] || "",
+        reasoning: "Generated by OpenCode server",
+        warnings: ["Could not parse structured response"]
+      };
     }
+  } catch (error) {
+    debugLog("error", "OpenCode request failed", { 
+      error: error.message,
+      sessionID 
+    });
+    
+    // If session is invalid, create a new one and retry once
+    if (error.message && (error.message.includes("404") || error.message.includes("not found"))) {
+      debugLog("info", "Session invalid, creating new one and retrying");
+      OPENCODE_SESSION_CACHE.delete(OPENCODE_SERVER);
+      sessionID = await createNewSession();
+      
+      const startTime = Date.now();
+      const messageResponse = await fetchJson(`${OPENCODE_SERVER}/session/${sessionID}/message`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          parts: [{ type: "text", text: fullPrompt }]
+        })
+      });
+      const elapsed = Date.now() - startTime;
+      
+      debugLog("info", "Retry successful", { elapsed: `${elapsed}ms` });
+      
+      const textParts = (messageResponse.parts || [])
+        .filter(part => part && part.type === "text")
+        .map(part => part.text)
+        .join("\n");
+      
+      try {
+        const parsed = normalizeQueryResponse(extractFirstJsonObject(textParts));
+        debugLog("info", "Successfully parsed retry response", { query: parsed.query });
+        return parsed;
+      } catch (error) {
+        debugLog("warn", "Failed to parse retry response", { error: error.message });
+        return {
+          query: textParts.trim().split("\n")[0] || "",
+          reasoning: "Generated by OpenCode server",
+          warnings: ["Could not parse structured response"]
+        };
+      }
+    }
+    
+    throw error;
   }
-
-  return normalizeQueryResponse(extractFirstJsonObject(raw));
 }
 
 async function fetchJson(url, options) {
@@ -809,7 +878,7 @@ async function fetchJson(url, options) {
   return payload;
 }
 
-async function generateViaOpenAI(promptBundle, configEntry) {
+async function generateViaOpenAI(promptBundle, configEntry, context) {
   if (!configEntry.apiKey) {
     throw new Error("OpenAI API key is not configured");
   }
@@ -846,7 +915,7 @@ async function generateViaOpenAI(promptBundle, configEntry) {
   return normalizeQueryResponse(extractFirstJsonObject(text));
 }
 
-async function generateViaAnthropic(promptBundle, configEntry) {
+async function generateViaAnthropic(promptBundle, configEntry, context) {
   if (!configEntry.apiKey) {
     throw new Error("Anthropic API key is not configured");
   }
@@ -889,6 +958,14 @@ async function generateViaAnthropic(promptBundle, configEntry) {
 }
 
 async function generateQuery(body) {
+  const startTime = Date.now();
+  debugLog("info", "Generate query request received", { 
+    providerId: body.providerId,
+    prompt: body.prompt,
+    model: body.model,
+    knownSymbolsCount: body.knownSymbols?.length || 0
+  });
+  
   const prompt = String(body.prompt || "").trim();
   if (!prompt) {
     throw new Error("Prompt is required");
@@ -910,36 +987,69 @@ async function generateQuery(body) {
     executionFeedback: body.executionFeedback
   });
 
+  debugLog("debug", "Prompt bundle created", {
+    systemPromptLength: promptBundle.system.length,
+    userPromptLength: promptBundle.user.length
+  });
+
   let result;
   let model = String(body.model || "").trim();
 
-  if (provider.id === "claude-cli") {
-    result = await generateViaClaude(promptBundle);
-    model = model || "cli-default";
-  } else if (provider.id === "codex-cli") {
-    result = await generateViaCodex(promptBundle, model, body.cwd);
-    model = model || "cli-default";
-  } else if (provider.id === "opencode-cli") {
-    result = await generateViaOpencode(promptBundle, model, body.cwd);
-    model = model || "cli-default";
-  } else if (provider.id === "openai-api") {
-    const entry = config.providers.openai || {};
-    result = await generateViaOpenAI(promptBundle, entry);
-    model = entry.model || model;
-  } else if (provider.id === "anthropic-api") {
-    const entry = config.providers.anthropic || {};
-    result = await generateViaAnthropic(promptBundle, entry);
-    model = entry.model || model;
-  } else {
-    throw new Error("Provider does not support query generation");
-  }
-
-  return {
-    ...result,
-    provider: provider.id,
-    providerName: provider.name,
-    model
+  const context = {
+    knownSymbols: body.knownSymbols || [],
+    host: body.host,
+    selectedEntity: body.selectedEntity,
+    currentQuery: body.currentQuery
   };
+
+  try {
+    if (provider.id === "claude-cli") {
+      result = await generateViaClaude(promptBundle, context);
+      model = model || "cli-default";
+    } else if (provider.id === "codex-cli") {
+      result = await generateViaCodex(promptBundle, model, body.cwd, context);
+      model = model || "cli-default";
+    } else if (provider.id === "opencode-cli") {
+      result = await generateViaOpencode(promptBundle, model, body.cwd, context);
+      model = model || "cli-default";
+    } else if (provider.id === "openai-api") {
+      const entry = config.providers.openai || {};
+      result = await generateViaOpenAI(promptBundle, entry, context);
+      model = entry.model || model;
+    } else if (provider.id === "anthropic-api") {
+      const entry = config.providers.anthropic || {};
+      result = await generateViaAnthropic(promptBundle, entry, context);
+      model = entry.model || model;
+    } else {
+      throw new Error("Provider does not support query generation");
+    }
+
+    const duration = Date.now() - startTime;
+    debugLog("info", "Query generation completed", {
+      provider: provider.id,
+      model,
+      duration: `${duration}ms`,
+      resultQuery: result.query,
+      resultWarnings: result.warnings?.length || 0
+    });
+
+    return {
+      ...result,
+      provider: provider.id,
+      providerName: provider.name,
+      model
+    };
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    debugLog("error", "Query generation failed", {
+      provider: provider.id,
+      model,
+      duration: `${duration}ms`,
+      error: error.message,
+      stack: error.stack
+    });
+    throw error;
+  }
 }
 
 function updateApiProviderConfig(providerId, body) {
@@ -1056,6 +1166,182 @@ async function handleRequest(req, res) {
       const body = await readRequestBody(req);
       const result = await generateQuery(body);
       sendJson(res, 200, result);
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/opencode/models") {
+      try {
+        const opencodeUrl = process.env.OPENCODE_SERVER_URL || "http://127.0.0.1:4096";
+        const response = await fetchJson(`${opencodeUrl}/config/providers`);
+        
+        // Extract models from the response
+        const models = [];
+        if (response.providers) {
+          for (const provider of response.providers) {
+            if (provider.models) {
+              for (const [modelId, modelInfo] of Object.entries(provider.models)) {
+                models.push({
+                  id: modelId,
+                  providerId: provider.id,
+                  name: modelInfo.name || modelId,
+                  family: modelInfo.family || "unknown"
+                });
+              }
+            }
+          }
+        }
+        
+        sendJson(res, 200, { models });
+      } catch (error) {
+        sendError(res, 500, error);
+      }
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/debug/logs") {
+      // Pre-process logs to avoid using functions in template literals
+      const logEntries = DEBUG_LOGS.slice().reverse().map(entry => {
+        const escapedMessage = escapeHtml(entry.message);
+        const escapedData = entry.data ? escapeHtml(typeof entry.data === 'object' ? JSON.stringify(entry.data, null, 2) : entry.data) : null;
+        
+        return {
+          level: entry.level,
+          timestamp: entry.timestamp,
+          message: escapedMessage,
+          data: escapedData
+        };
+      });
+      
+      const html = `<!DOCTYPE html>
+<html>
+<head>
+  <title>AI Bridge Debug Logs</title>
+  <style>
+    body {
+      font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+      background: #1e1e1e;
+      color: #d4d4d4;
+      margin: 0;
+      padding: 20px;
+    }
+    h1 {
+      color: #4ec9b0;
+      margin-top: 0;
+    }
+    .controls {
+      margin-bottom: 20px;
+    }
+    button {
+      background: #0e639c;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-right: 8px;
+    }
+    button:hover {
+      background: #1177bb;
+    }
+    .stats {
+      background: #252526;
+      padding: 12px;
+      border-radius: 4px;
+      margin-bottom: 20px;
+    }
+    .log-entry {
+      background: #252526;
+      margin-bottom: 8px;
+      padding: 12px;
+      border-radius: 4px;
+      border-left: 3px solid #0e639c;
+    }
+    .log-entry.log-info { border-left-color: #0e639c; }
+    .log-entry.log-warn { border-left-color: #cca700; }
+    .log-entry.log-error { border-left-color: #f48771; }
+    .log-timestamp {
+      color: #858585;
+      font-size: 0.85em;
+    }
+    .log-level {
+      font-weight: bold;
+      text-transform: uppercase;
+      margin: 0 8px;
+    }
+    .log-level.log-info { color: #4ec9b0; }
+    .log-level.log-warn { color: #cca700; }
+    .log-level.log-error { color: #f48771; }
+    .log-message {
+      color: #d4d4d4;
+      margin-top: 8px;
+    }
+    .log-data {
+      background: #1e1e1e;
+      padding: 8px;
+      margin-top: 8px;
+      border-radius: 4px;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      color: #9cdcfe;
+    }
+    .refresh-notice {
+      color: #858585;
+      font-style: italic;
+    }
+  </style>
+</head>
+<body>
+  <h1>AI Bridge Debug Logs</h1>
+  
+  <div class="controls">
+    <button onclick="location.reload()">Refresh</button>
+    <button onclick="fetch('/v1/debug/logs/clear', {method: 'POST'}).then(() => location.reload())">Clear Logs</button>
+    <button onclick="toggleAutoRefresh()">Toggle Auto-Refresh (2s)</button>
+    <span class="refresh-notice" id="auto-refresh-status"></span>
+  </div>
+  
+  <div class="stats">
+    <strong>Total Logs:</strong> ${DEBUG_LOGS.length} / ${MAX_DEBUG_LOGS}
+  </div>
+  
+  <div id="logs">
+    ${logEntries.map(entry => `
+      <div class="log-entry log-${entry.level}">
+        <div>
+          <span class="log-timestamp">${entry.timestamp}</span>
+          <span class="log-level log-${entry.level}">${entry.level}</span>
+        </div>
+        <div class="log-message">${entry.message}</div>
+        ${entry.data ? `<div class="log-data">${entry.data}</div>` : ''}
+      </div>
+    `).join('')}
+  </div>
+  
+  <script>
+    let autoRefreshInterval = null;
+    
+    function toggleAutoRefresh() {
+      if (autoRefreshInterval) {
+        clearInterval(autoRefreshInterval);
+        autoRefreshInterval = null;
+        document.getElementById('auto-refresh-status').textContent = '';
+      } else {
+        autoRefreshInterval = setInterval(() => location.reload(), 2000);
+        document.getElementById('auto-refresh-status').textContent = 'Auto-refreshing every 2s';
+      }
+    }
+  </script>
+</body>
+</html>`;
+      
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(html);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/debug/logs/clear") {
+      DEBUG_LOGS.length = 0;
+      sendJson(res, 200, { ok: true, message: "Logs cleared" });
       return;
     }
 

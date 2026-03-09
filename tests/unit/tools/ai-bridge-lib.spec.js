@@ -1,8 +1,10 @@
 const {
   buildQueryPrompt,
+  executeToolCall,
   extractDeviceCode,
   extractFirstJsonObject,
   extractFirstUrl,
+  getToolDefinitions,
   normalizeQueryResponse,
   parseOpencodeAuthList
 } = require("../../../tools/ai-bridge-lib");
@@ -79,5 +81,91 @@ describe("ai-bridge-lib", () => {
     expect(prompt.user).toContain("Latest explorer execution feedback:");
     expect(prompt.user).toContain("entities with Position but not Velocity: Position, !Velocity");
     expect(prompt.user).toContain("spaceships docked to planets using variables: SpaceShip($this), DockedTo($this, $planet), Planet($planet)");
+  });
+
+  test("exposes tool definitions for the agent", () => {
+    const tools = getToolDefinitions();
+
+    expect(Array.isArray(tools)).toBe(true);
+    expect(tools.length).toBe(2);
+    expect(tools[0].name).toBe("list_entities");
+    expect(tools[0].description).toContain("entities");
+    expect(tools[0].input_schema.type).toBe("object");
+    expect(tools[1].name).toBe("search_entities");
+    expect(tools[1].input_schema.properties.pattern).toBeDefined();
+  });
+
+  test("executes list_entities tool with known symbols", () => {
+    const context = {
+      knownSymbols: ["Position", "Velocity", "Health", "Mass"]
+    };
+
+    const result = executeToolCall("list_entities", {}, context);
+
+    expect(result.ok).toBe(true);
+    expect(result.result).toContain("Position");
+    expect(result.result).toContain("Velocity");
+    expect(result.result).toContain("Total: 4");
+  });
+
+  test("executes list_entities tool with empty symbols", () => {
+    const result = executeToolCall("list_entities", {}, { knownSymbols: [] });
+
+    expect(result.ok).toBe(true);
+    expect(result.result).toContain("No entities or components");
+  });
+
+  test("executes search_entities tool with matching pattern", () => {
+    const context = {
+      knownSymbols: ["Position", "Position3", "Velocity", "Velocity3", "Health"]
+    };
+
+    const result = executeToolCall("search_entities", { pattern: "Pos.*" }, context);
+
+    expect(result.ok).toBe(true);
+    expect(result.result).toContain("Found 2");
+    expect(result.result).toContain("Position");
+    expect(result.result).toContain("Position3");
+    expect(result.result).not.toContain("Velocity");
+  });
+
+  test("executes search_entities tool with no matches", () => {
+    const context = {
+      knownSymbols: ["Position", "Velocity"]
+    };
+
+    const result = executeToolCall("search_entities", { pattern: "NonExistent.*" }, context);
+
+    expect(result.ok).toBe(true);
+    expect(result.result).toContain("No entities or components found");
+  });
+
+  test("executes search_entities tool with invalid regex", () => {
+    const context = {
+      knownSymbols: ["Position"]
+    };
+
+    const result = executeToolCall("search_entities", { pattern: "[invalid(" }, context);
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("Invalid regex pattern");
+  });
+
+  test("executes search_entities tool with limit", () => {
+    const context = {
+      knownSymbols: ["Pos1", "Pos2", "Pos3", "Pos4", "Pos5"]
+    };
+
+    const result = executeToolCall("search_entities", { pattern: "Pos.*", limit: 3 }, context);
+
+    expect(result.ok).toBe(true);
+    expect(result.result).toContain("Found 3");
+  });
+
+  test("returns error for unknown tool", () => {
+    const result = executeToolCall("unknown_tool", {}, {});
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("Unknown tool");
   });
 });
