@@ -32,9 +32,33 @@ const AUTH_SESSION_POLL_MS = 1500;
 const AUTH_SESSION_TIMEOUT_MS = 3 * 60 * 1000;
 const AUTH_SESSION_RETENTION_MS = 10 * 60 * 1000;
 const AUTH_SESSION_OUTPUT_LIMIT = 2400;
+const GENERATION_JOB_POLL_MS = 400;
+const GENERATION_JOB_TIMEOUT_MS = 90 * 1000;
+const GENERATION_JOB_RETENTION_MS = 10 * 60 * 1000;
+const GENERATION_JOB_EVENT_LIMIT = 12;
+const OPENCODE_SERVER_TIMEOUT_MS = 5000;
+const OPENCODE_REQUEST_TIMEOUT_MS = 10000;
+const MAX_PROVIDER_TOOL_STEPS = 3;
 const MAX_TOOL_RESULTS = 8;
+const OPENCODE_DISABLED_TOOLS = {
+  invalid: false,
+  question: false,
+  bash: false,
+  read: false,
+  glob: false,
+  grep: false,
+  task: false,
+  webfetch: false,
+  websearch: false,
+  codesearch: false,
+  todowrite: false,
+  todoread: false,
+  skill: false,
+  apply_patch: false,
+  lsp: false
+};
 const AUTH_SESSIONS = new Map();
-const OPENCODE_SESSION_CACHE = new Map();
+const GENERATION_JOBS = new Map();
 const DEBUG_LOGS = [];
 const MAX_DEBUG_LOGS = 100;
 
@@ -63,6 +87,198 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
+}
+
+function getOpencodeServerUrl() {
+  return process.env.OPENCODE_SERVER_URL || "http://127.0.0.1:4096";
+}
+
+function createAbortError(message = "Request aborted") {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+function createTimeoutError(message) {
+  const error = new Error(message);
+  error.name = "TimeoutError";
+  return error;
+}
+
+function isTerminalGenerationJobStatus(status) {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+function serializeGenerationJob(job) {
+  return {
+    id: job.id,
+    providerId: job.providerId,
+    providerName: job.providerName,
+    model: job.model || "",
+    status: job.status,
+    stage: job.stage || "",
+    stageDetail: job.stageDetail || "",
+    startedAt: job.startedAt,
+    updatedAt: job.updatedAt,
+    completedAt: job.completedAt || "",
+    elapsedMs: Date.now() - job.startedAtMs,
+    canCancel: Boolean(job.canCancel),
+    result: job.result,
+    error: job.error || "",
+    events: job.events || []
+  };
+}
+
+function appendGenerationJobEvent(job, message, level = "info") {
+  if (!message) {
+    return;
+  }
+
+  const nextEvents = (job.events || []).concat({
+    time: new Date().toISOString(),
+    level,
+    message: String(message)
+  });
+
+  job.events = nextEvents.slice(-GENERATION_JOB_EVENT_LIMIT);
+}
+
+function updateGenerationJob(job, patch) {
+  Object.assign(job, patch, {
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function setGenerationJobStage(job, stage, detail = "", level = "info") {
+  const nextStage = String(stage || "").trim();
+  const nextDetail = String(detail || "").trim();
+
+  if (job.stage === nextStage && job.stageDetail === nextDetail) {
+    return;
+  }
+
+  updateGenerationJob(job, {
+    stage: nextStage,
+    stageDetail: nextDetail,
+    status: job.status === "queued" ? "running" : job.status
+  });
+  appendGenerationJobEvent(job, nextDetail ? `${nextStage}: ${nextDetail}` : nextStage, level);
+}
+
+function scheduleGenerationJobRetirement(job) {
+  if (job.retireTimer) {
+    clearTimeout(job.retireTimer);
+  }
+
+  job.retireTimer = setTimeout(() => {
+    GENERATION_JOBS.delete(job.id);
+  }, GENERATION_JOB_RETENTION_MS);
+}
+
+function finalizeGenerationJob(job, status, patch = {}) {
+  if (isTerminalGenerationJobStatus(job.status)) {
+    return job;
+  }
+
+  updateGenerationJob(job, {
+    ...patch,
+    status,
+    canCancel: false,
+    completedAt: new Date().toISOString()
+  });
+  scheduleGenerationJobRetirement(job);
+  return job;
+}
+
+function createGenerationJob({ providerId, providerName, model }) {
+  const now = new Date();
+  const job = {
+    id: crypto.randomUUID(),
+    providerId,
+    providerName,
+    model: model || "",
+    status: "queued",
+    stage: "Queued",
+    stageDetail: "Waiting to start generation",
+    startedAt: now.toISOString(),
+    startedAtMs: now.getTime(),
+    updatedAt: now.toISOString(),
+    completedAt: "",
+    canCancel: true,
+    result: undefined,
+    error: "",
+    events: [],
+    abortController: new AbortController(),
+    cancel: undefined,
+    retireTimer: undefined
+  };
+
+  appendGenerationJobEvent(job, "Queued: Waiting to start generation");
+  GENERATION_JOBS.set(job.id, job);
+  return job;
+}
+
+function getGenerationJob(jobId) {
+  const job = GENERATION_JOBS.get(jobId);
+  if (!job) {
+    throw new Error("Generation job not found");
+  }
+  return job;
+}
+
+async function cancelGenerationJob(job, reason = "Generation cancelled") {
+  if (isTerminalGenerationJobStatus(job.status)) {
+    return job;
+  }
+
+  appendGenerationJobEvent(job, reason, "warn");
+
+  const cancel = job.cancel;
+  if (typeof cancel === "function") {
+    try {
+      await cancel();
+    } catch (error) {
+      appendGenerationJobEvent(job, `Abort cleanup failed: ${error.message || error}`, "warn");
+    }
+  }
+
+  if (!job.abortController.signal.aborted) {
+    job.abortController.abort(createAbortError(reason));
+  }
+
+  finalizeGenerationJob(job, "cancelled", {
+    stage: "Cancelled",
+    stageDetail: reason,
+    error: ""
+  });
+
+  return job;
+}
+
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      reject(signal.reason || createAbortError());
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      if (signal) {
+        signal.removeEventListener("abort", onAbort);
+      }
+      resolve();
+    }, ms);
+
+    function onAbort() {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason || createAbortError());
+    }
+
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
 }
 
 const PROVIDERS = {
@@ -309,6 +525,101 @@ function summarizeError(prefix, result) {
   return detail ? `${prefix}: ${detail}` : prefix;
 }
 
+function parseOpencodeModelRef(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return undefined;
+  }
+
+  const separatorIndex = text.indexOf("/");
+  if (separatorIndex <= 0 || separatorIndex === text.length - 1) {
+    return undefined;
+  }
+
+  const providerID = text.slice(0, separatorIndex).trim();
+  const modelID = text.slice(separatorIndex + 1).trim();
+  if (!providerID || !modelID) {
+    return undefined;
+  }
+
+  return { providerID, modelID };
+}
+
+function extractOpencodeTextParts(messageResponse) {
+  if (!messageResponse || !Array.isArray(messageResponse.parts)) {
+    return "";
+  }
+
+  return messageResponse.parts
+    .filter((part) => part && part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+}
+
+function findCompletedOpencodeMessage(messages) {
+  if (!Array.isArray(messages)) {
+    return undefined;
+  }
+
+  return messages.find((message) => {
+    return message &&
+      message.info &&
+      message.info.role === "assistant" &&
+      message.info.time &&
+      message.info.time.completed;
+  });
+}
+
+function extractOpencodeMessageError(message) {
+  if (!message || !message.info || !message.info.error) {
+    return "";
+  }
+
+  const error = message.info.error;
+  if (typeof error === "string") {
+    return error;
+  }
+
+  if (error.data && error.data.message) {
+    return String(error.data.message);
+  }
+
+  if (error.message) {
+    return String(error.message);
+  }
+
+  return "OpenCode returned an error";
+}
+
+async function getOpencodeServerStatus(signal) {
+  const serverUrl = getOpencodeServerUrl();
+
+  try {
+    const response = await fetchJson(`${serverUrl}/global/health`, {
+      signal,
+      timeout: OPENCODE_SERVER_TIMEOUT_MS
+    });
+
+    return {
+      healthy: Boolean(response && response.healthy),
+      serverUrl,
+      version: response && response.version ? String(response.version) : "",
+      message: response && response.healthy
+        ? `OpenCode server reachable at ${serverUrl}`
+        : `OpenCode server is unhealthy at ${serverUrl}`
+    };
+  } catch (error) {
+    return {
+      healthy: false,
+      serverUrl,
+      version: "",
+      message: `OpenCode server unavailable at ${serverUrl}`,
+      error: String(error.message || error)
+    };
+  }
+}
+
 async function getCliProviderStatus(provider) {
   const binaryPath = lookupBinary(provider.binary);
   if (!binaryPath) {
@@ -363,17 +674,34 @@ async function getCliProviderStatus(provider) {
     timeout: 10000
   });
   const parsed = parseOpencodeAuthList(result.stdout || result.stderr);
+  const serverStatus = await getOpencodeServerStatus();
+  const credentialsReady = parsed.ready;
+  const serverReady = serverStatus.healthy;
+  const ready = credentialsReady && serverReady;
+  const status = !credentialsReady
+    ? "needs_auth"
+    : (serverReady ? "ready" : "needs_server");
+
   return {
     ...provider,
     installed: true,
-    ready: parsed.ready,
-    status: parsed.ready ? "ready" : "needs_auth",
-    message: parsed.ready
-      ? `${parsed.credentialCount} configured credential${parsed.credentialCount === 1 ? "" : "s"}`
-      : "OpenCode CLI needs sign-in",
+    ready,
+    status,
+    message: !credentialsReady
+      ? "OpenCode CLI needs sign-in"
+      : (
+          serverReady
+            ? `${parsed.credentialCount} configured credential${parsed.credentialCount === 1 ? "" : "s"}`
+            : `${parsed.credentialCount} configured credential${parsed.credentialCount === 1 ? "" : "s"}; start the OpenCode server`
+        ),
     details: parsed,
     command: provider.loginCommand.join(" "),
-    binaryPath
+    binaryPath,
+    serverHealthy: serverReady,
+    serverMessage: serverStatus.message,
+    serverError: serverStatus.error || "",
+    serverUrl: serverStatus.serverUrl,
+    serverVersion: serverStatus.version
   };
 }
 
@@ -701,184 +1029,395 @@ async function startBrowserOauth(providerId) {
 
 function extractToolCallsFromResponse(rawOutput) {
   const text = stripAnsi(rawOutput);
-  const toolCalls = [];
 
   try {
-    const parsed = JSON.parse(text);
+    const parsed = extractFirstJsonObject(text);
     if (parsed && parsed.tool_use) {
-      toolCalls.push(...(Array.isArray(parsed.tool_use) ? parsed.tool_use : [parsed.tool_use]));
+      return Array.isArray(parsed.tool_use) ? parsed.tool_use : [parsed.tool_use];
     }
   } catch (error) {
-    // Try to find tool calls in the text
-    const toolUseMatch = text.match(/"tool_use"\s*:\s*\[/);
-    if (toolUseMatch) {
-      try {
-        const jsonMatch = text.slice(toolUseMatch.index).match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          if (parsed && parsed.tool_use) {
-            toolCalls.push(...(Array.isArray(parsed.tool_use) ? parsed.tool_use : [parsed.tool_use]));
-          }
-        }
-      } catch (e) {
-        // Ignore parse errors
-      }
-    }
+    // Ignore parse errors and fall back to no tool calls.
   }
 
-  return toolCalls;
+  return [];
 }
 
-async function generateViaOpencode(promptBundle, model, cwd, context) {
-  const OPENCODE_SERVER = process.env.OPENCODE_SERVER_URL || "http://127.0.0.1:4096";
-  
-  debugLog("info", "Starting OpenCode generation", { 
-    server: OPENCODE_SERVER, 
-    model: model || "default",
-    symbolsCount: (context.knownSymbols || []).length 
-  });
-  
-  async function createNewSession() {
-    debugLog("info", "Creating new OpenCode session");
-    const sessionResponse = await fetchJson(`${OPENCODE_SERVER}/session`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({})
-    });
-    
-    const sessionID = sessionResponse.id;
-    OPENCODE_SESSION_CACHE.set(OPENCODE_SERVER, sessionID);
-    debugLog("info", "OpenCode session created", { sessionID });
-    return sessionID;
+function normalizeToolInput(toolName, rawInput) {
+  if (!rawInput || typeof rawInput === "undefined") {
+    return {};
   }
-  
-  // Reuse or create session (cache by server URL)
-  let sessionID = OPENCODE_SESSION_CACHE.get(OPENCODE_SERVER);
-  
-  if (!sessionID) {
-    debugLog("info", "No cached session, creating new one");
-    sessionID = await createNewSession();
-  } else {
-    debugLog("info", "Using cached session", { sessionID });
-  }
-  
-  // Prepare the message
-  const fullPrompt = `${promptBundle.system}\n\n${promptBundle.user}\n\nAvailable components: ${(context.knownSymbols || []).slice(0, 20).join(", ")}`;
-  const promptLength = fullPrompt.length;
-  
-  debugLog("info", "Sending message to OpenCode", { 
-    sessionID, 
-    promptLength,
-    userPrompt: promptBundle.user 
-  });
-  
-  // Send message and wait for response
-  try {
-    const startTime = Date.now();
-    const messageResponse = await fetchJson(`${OPENCODE_SERVER}/session/${sessionID}/message`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        parts: [{ type: "text", text: fullPrompt }]
-      })
-    });
-    const elapsed = Date.now() - startTime;
-    
-    debugLog("info", "OpenCode response received", { 
-      elapsed: `${elapsed}ms`,
-      partsCount: (messageResponse.parts || []).length 
-    });
-    
-    // Extract text from response parts
-    const textParts = (messageResponse.parts || [])
-      .filter(part => part && part.type === "text")
-      .map(part => part.text)
-      .join("\n");
-    
-    debugLog("debug", "Response text extracted", { 
-      textLength: textParts.length,
-      preview: textParts.substring(0, 200)
-    });
-    
-    // Try to parse as JSON
-    try {
-      const parsed = normalizeQueryResponse(extractFirstJsonObject(textParts));
-      debugLog("info", "Successfully parsed response", { query: parsed.query });
-      return parsed;
-    } catch (error) {
-      debugLog("warn", "Failed to parse JSON, using raw text", { error: error.message });
-      return {
-        query: textParts.trim().split("\n")[0] || "",
-        reasoning: "Generated by OpenCode server",
-        warnings: ["Could not parse structured response"]
-      };
+
+  if (typeof rawInput === "string") {
+    const trimmed = rawInput.trim();
+    if (!trimmed) {
+      return {};
     }
-  } catch (error) {
-    debugLog("error", "OpenCode request failed", { 
-      error: error.message,
-      sessionID 
+
+    try {
+      const parsed = extractFirstJsonObject(trimmed);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch (error) {
+      // Fall back to a tool-specific coercion below.
+    }
+
+    if (toolName === "search_entities") {
+      return { pattern: trimmed };
+    }
+
+    return {};
+  }
+
+  if (typeof rawInput === "object" && !Array.isArray(rawInput)) {
+    return rawInput;
+  }
+
+  return {};
+}
+
+function normalizeToolCalls(toolCalls) {
+  if (!Array.isArray(toolCalls)) {
+    return [];
+  }
+
+  return toolCalls
+    .map((toolCall) => {
+      const name = String(
+        toolCall && (toolCall.name || toolCall.tool || toolCall.tool_name || "")
+      ).trim();
+
+      const rawInput = toolCall && typeof toolCall === "object"
+        ? (toolCall.input || toolCall.arguments || toolCall.params || {})
+        : {};
+      const input = normalizeToolInput(name, rawInput);
+
+      return { name, input };
+    })
+    .filter((toolCall) => toolCall.name)
+    .slice(0, MAX_TOOL_RESULTS);
+}
+
+function formatToolResults(toolCalls, toolResults) {
+  const lines = [
+    "Tool results are now available.",
+    "Use these results to continue the Flecs query generation.",
+    "Return either another tool request object with key tool_use or the final object with keys query, reasoning, warnings."
+  ];
+
+  toolResults.forEach((result, index) => {
+    const input = toolCalls[index] && toolCalls[index].input
+      ? JSON.stringify(toolCalls[index].input)
+      : "{}";
+    lines.push(
+      "",
+      `Tool ${index + 1}: ${result.name}(${input})`,
+      result.ok ? result.result : `ERROR: ${result.error}`
+    );
+  });
+
+  return lines.join("\n");
+}
+
+async function generateViaOpencode(promptBundle, model, cwd, context, runtime = {}) {
+  const serverUrl = getOpencodeServerUrl();
+  const selectedModel = parseOpencodeModelRef(model);
+  const signal = runtime.signal;
+  const onStage = typeof runtime.onStage === "function" ? runtime.onStage : () => {};
+  const timeoutMs = runtime.timeout || GENERATION_JOB_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
+  let sessionID = "";
+
+  debugLog("info", "Starting OpenCode generation", {
+    server: serverUrl,
+    model: model || "default",
+    symbolsCount: (context.knownSymbols || []).length
+  });
+
+  const abortRemoteSession = async () => {
+    if (!sessionID) {
+      return;
+    }
+
+    try {
+      await fetchJson(`${serverUrl}/session/${sessionID}/abort`, {
+        method: "POST",
+        timeout: OPENCODE_REQUEST_TIMEOUT_MS
+      });
+      debugLog("info", "OpenCode session aborted", { sessionID });
+    } catch (error) {
+      debugLog("warn", "Failed to abort OpenCode session", {
+        sessionID,
+        error: error.message
+      });
+    }
+  };
+
+  if (typeof runtime.setCancel === "function") {
+    runtime.setCancel(abortRemoteSession);
+  }
+
+  try {
+    onStage("Checking OpenCode server", `Connecting to ${serverUrl}`);
+    const health = await fetchJson(`${serverUrl}/global/health`, {
+      signal,
+      timeout: OPENCODE_SERVER_TIMEOUT_MS
     });
-    
-    // If session is invalid, create a new one and retry once
-    if (error.message && (error.message.includes("404") || error.message.includes("not found"))) {
-      debugLog("info", "Session invalid, creating new one and retrying");
-      OPENCODE_SESSION_CACHE.delete(OPENCODE_SERVER);
-      sessionID = await createNewSession();
-      
-      const startTime = Date.now();
-      const messageResponse = await fetchJson(`${OPENCODE_SERVER}/session/${sessionID}/message`, {
+    if (!health || !health.healthy) {
+      throw new Error(`OpenCode server is not healthy at ${serverUrl}`);
+    }
+
+    onStage("Creating OpenCode session", selectedModel
+      ? `Using ${selectedModel.providerID}/${selectedModel.modelID}`
+      : "Using the server default model");
+    const sessionResponse = await fetchJson(`${serverUrl}/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+      signal,
+      timeout: OPENCODE_REQUEST_TIMEOUT_MS
+    });
+
+    sessionID = sessionResponse.id;
+    if (!sessionID) {
+      throw new Error("OpenCode server did not return a session id");
+    }
+
+    debugLog("info", "OpenCode session created", { sessionID });
+
+    async function runPrompt(text, step) {
+      onStage("Dispatching prompt", step > 0
+        ? `Sent tool results back to OpenCode (step ${step + 1})`
+        : "OpenCode accepted the query request");
+
+      const promptRequest = {
+        system: promptBundle.system,
+        tools: OPENCODE_DISABLED_TOOLS,
+        parts: [{ type: "text", text }]
+      };
+
+      if (selectedModel) {
+        promptRequest.model = selectedModel;
+      }
+
+      await fetchJson(`${serverUrl}/session/${sessionID}/prompt_async`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          parts: [{ type: "text", text: fullPrompt }]
-        })
+        body: JSON.stringify(promptRequest),
+        signal,
+        timeout: OPENCODE_REQUEST_TIMEOUT_MS
       });
-      const elapsed = Date.now() - startTime;
-      
-      debugLog("info", "Retry successful", { elapsed: `${elapsed}ms` });
-      
-      const textParts = (messageResponse.parts || [])
-        .filter(part => part && part.type === "text")
-        .map(part => part.text)
-        .join("\n");
-      
-      try {
-        const parsed = normalizeQueryResponse(extractFirstJsonObject(textParts));
-        debugLog("info", "Successfully parsed retry response", { query: parsed.query });
-        return parsed;
-      } catch (error) {
-        debugLog("warn", "Failed to parse retry response", { error: error.message });
-        return {
-          query: textParts.trim().split("\n")[0] || "",
-          reasoning: "Generated by OpenCode server",
-          warnings: ["Could not parse structured response"]
-        };
+
+      let lastStage = "";
+
+      while (Date.now() < deadline) {
+        if (signal && signal.aborted) {
+          throw signal.reason || createAbortError("Generation cancelled");
+        }
+
+        const [statuses, messages] = await Promise.all([
+          fetchJson(`${serverUrl}/session/status`, {
+            signal,
+            timeout: OPENCODE_REQUEST_TIMEOUT_MS
+          }),
+          fetchJson(`${serverUrl}/session/${sessionID}/message?limit=1`, {
+            signal,
+            timeout: OPENCODE_REQUEST_TIMEOUT_MS
+          })
+        ]);
+
+        const sessionStatus = statuses ? statuses[sessionID] : undefined;
+        const latestMessage = Array.isArray(messages) ? messages[0] : undefined;
+        const completedMessage = findCompletedOpencodeMessage(messages);
+
+        if (sessionStatus && sessionStatus.type === "busy") {
+          lastStage = "Waiting for OpenCode";
+          onStage(lastStage, selectedModel
+            ? `Model ${selectedModel.providerID}/${selectedModel.modelID} is generating a reply`
+            : "OpenCode is generating a reply");
+        } else if (latestMessage && Array.isArray(latestMessage.parts) && latestMessage.parts.length) {
+          lastStage = "Receiving response";
+          onStage(lastStage, "OpenCode has started returning the answer");
+        } else if (!lastStage) {
+          lastStage = "Waiting for OpenCode";
+          onStage(lastStage, "Waiting for the first response chunk");
+        }
+
+        if (completedMessage) {
+          const messageError = extractOpencodeMessageError(completedMessage);
+          if (messageError) {
+            throw new Error(`OpenCode returned an error: ${messageError}`);
+          }
+
+          const responseText = extractOpencodeTextParts(completedMessage);
+          if (!responseText) {
+            throw new Error("OpenCode response did not contain any text");
+          }
+
+          debugLog("debug", "OpenCode response text extracted", {
+            sessionID,
+            textLength: responseText.length,
+            preview: responseText.slice(0, 200)
+          });
+
+          return {
+            text: responseText,
+            completedMessage
+          };
+        }
+
+        await sleep(GENERATION_JOB_POLL_MS, signal);
       }
+
+      throw createTimeoutError(`OpenCode did not finish within ${Math.round(timeoutMs / 1000)} seconds`);
     }
-    
+
+    let promptText = promptBundle.user;
+
+    for (let toolStep = 0; toolStep <= MAX_PROVIDER_TOOL_STEPS; toolStep ++) {
+      const reply = await runPrompt(promptText, toolStep);
+      const toolCalls = normalizeToolCalls(extractToolCallsFromResponse(reply.text));
+
+      if (!toolCalls.length) {
+        onStage("Parsing response", "Reading the generated Flecs query");
+
+        try {
+          const parsed = normalizeQueryResponse(extractFirstJsonObject(reply.text));
+          return {
+            ...parsed,
+            resolvedModel: reply.completedMessage.info && reply.completedMessage.info.providerID && reply.completedMessage.info.modelID
+              ? `${reply.completedMessage.info.providerID}/${reply.completedMessage.info.modelID}`
+              : (model || "")
+          };
+        } catch (error) {
+          debugLog("warn", "Failed to parse OpenCode JSON response", {
+            sessionID,
+            error: error.message
+          });
+
+          return {
+            query: reply.text.split("\n")[0].trim(),
+            reasoning: "Generated by OpenCode server",
+            warnings: ["Could not parse structured response"],
+            resolvedModel: reply.completedMessage.info && reply.completedMessage.info.providerID && reply.completedMessage.info.modelID
+              ? `${reply.completedMessage.info.providerID}/${reply.completedMessage.info.modelID}`
+              : (model || "")
+          };
+        }
+      }
+
+      if (toolStep >= MAX_PROVIDER_TOOL_STEPS) {
+        throw new Error(`OpenCode requested too many tool rounds (limit ${MAX_PROVIDER_TOOL_STEPS})`);
+      }
+
+      onStage("Running discovery tools", `Executing ${toolCalls.length} tool call${toolCalls.length === 1 ? "" : "s"}`);
+      const toolResults = toolCalls.map((toolCall) => {
+        const result = executeToolCall(toolCall.name, toolCall.input, context);
+        debugLog("info", "Executed query discovery tool", {
+          name: toolCall.name,
+          input: toolCall.input,
+          ok: result.ok
+        });
+        return {
+          name: toolCall.name,
+          ...result
+        };
+      });
+
+      promptText = formatToolResults(toolCalls, toolResults);
+    }
+  } catch (error) {
+    if (error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+      await abortRemoteSession();
+    }
+
+    debugLog("error", "OpenCode request failed", {
+      error: error.message,
+      sessionID
+    });
     throw error;
   }
 }
 
-async function fetchJson(url, options) {
-  const response = await fetch(url, options);
-  const text = await response.text();
+async function fetchJson(url, options = {}) {
+  const {
+    timeout = 0,
+    signal,
+    ...fetchOptions
+  } = options;
 
-  let payload;
+  const controller = new AbortController();
+  let timedOut = false;
+  let timeoutId = 0;
+
+  const abortFromSignal = () => {
+    controller.abort(signal && signal.reason ? signal.reason : createAbortError());
+  };
+
+  if (signal) {
+    if (signal.aborted) {
+      abortFromSignal();
+    } else {
+      signal.addEventListener("abort", abortFromSignal, { once: true });
+    }
+  }
+
+  if (timeout > 0) {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort(createTimeoutError(`Request timed out after ${timeout}ms`));
+    }, timeout);
+  }
+
   try {
-    payload = text ? JSON.parse(text) : {};
+    const response = await fetch(url, {
+      ...fetchOptions,
+      signal: controller.signal
+    });
+    const text = await response.text();
+
+    let payload;
+    try {
+      payload = text ? JSON.parse(text) : {};
+    } catch (error) {
+      payload = { raw: text };
+    }
+
+    if (!response.ok) {
+      throw new Error(payload.error && payload.error.message ? payload.error.message : text || `HTTP ${response.status}`);
+    }
+
+    return payload;
   } catch (error) {
-    payload = { raw: text };
+    if (timedOut) {
+      throw createTimeoutError(`Request timed out after ${timeout}ms`);
+    }
+    if (signal && signal.aborted) {
+      throw signal.reason || createAbortError();
+    }
+    throw error;
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    if (signal) {
+      signal.removeEventListener("abort", abortFromSignal);
+    }
   }
-
-  if (!response.ok) {
-    throw new Error(payload.error && payload.error.message ? payload.error.message : text || `HTTP ${response.status}`);
-  }
-
-  return payload;
 }
 
-async function generateViaOpenAI(promptBundle, configEntry, context) {
+async function generateViaClaude() {
+  throw new Error("Claude CLI generation is not implemented in this branch");
+}
+
+async function generateViaCodex() {
+  throw new Error("Codex CLI generation is not implemented in this branch");
+}
+
+async function generateViaOpenAI(promptBundle, configEntry, context, runtime = {}) {
+  const signal = runtime.signal;
+  const onStage = typeof runtime.onStage === "function" ? runtime.onStage : () => {};
+
   if (!configEntry.apiKey) {
     throw new Error("OpenAI API key is not configured");
   }
@@ -886,6 +1425,7 @@ async function generateViaOpenAI(promptBundle, configEntry, context) {
     throw new Error("OpenAI model is not configured");
   }
 
+  onStage("Calling OpenAI API", `Generating with ${configEntry.model}`);
   const payload = await fetchJson("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
@@ -904,7 +1444,9 @@ async function generateViaOpenAI(promptBundle, configEntry, context) {
           content: promptBundle.user
         }
       ]
-    })
+    }),
+    signal,
+    timeout: GENERATION_JOB_TIMEOUT_MS
   });
 
   const text = payload.output_text || findStringWithJson(payload.output) || findStringWithJson(payload);
@@ -915,7 +1457,10 @@ async function generateViaOpenAI(promptBundle, configEntry, context) {
   return normalizeQueryResponse(extractFirstJsonObject(text));
 }
 
-async function generateViaAnthropic(promptBundle, configEntry, context) {
+async function generateViaAnthropic(promptBundle, configEntry, context, runtime = {}) {
+  const signal = runtime.signal;
+  const onStage = typeof runtime.onStage === "function" ? runtime.onStage : () => {};
+
   if (!configEntry.apiKey) {
     throw new Error("Anthropic API key is not configured");
   }
@@ -923,6 +1468,7 @@ async function generateViaAnthropic(promptBundle, configEntry, context) {
     throw new Error("Anthropic model is not configured");
   }
 
+  onStage("Calling Anthropic API", `Generating with ${configEntry.model}`);
   const payload = await fetchJson("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -940,7 +1486,9 @@ async function generateViaAnthropic(promptBundle, configEntry, context) {
           content: promptBundle.user
         }
       ]
-    })
+    }),
+    signal,
+    timeout: GENERATION_JOB_TIMEOUT_MS
   });
 
   const textBlocks = Array.isArray(payload.content)
@@ -957,8 +1505,9 @@ async function generateViaAnthropic(promptBundle, configEntry, context) {
   return normalizeQueryResponse(extractFirstJsonObject(text));
 }
 
-async function generateQuery(body) {
+async function generateQuery(body, runtime = {}) {
   const startTime = Date.now();
+  const onStage = typeof runtime.onStage === "function" ? runtime.onStage : () => {};
   debugLog("info", "Generate query request received", { 
     providerId: body.providerId,
     prompt: body.prompt,
@@ -976,6 +1525,7 @@ async function generateQuery(body) {
     throw new Error("Unknown provider");
   }
 
+  onStage("Building prompt", "Preparing explorer context for generation");
   const config = loadBridgeConfig(CONFIG_PATH);
   const promptBundle = buildQueryPrompt({
     prompt,
@@ -1004,25 +1554,29 @@ async function generateQuery(body) {
 
   try {
     if (provider.id === "claude-cli") {
-      result = await generateViaClaude(promptBundle, context);
+      onStage("Calling Claude CLI", "Starting provider generation");
+      result = await generateViaClaude(promptBundle, context, runtime);
       model = model || "cli-default";
     } else if (provider.id === "codex-cli") {
-      result = await generateViaCodex(promptBundle, model, body.cwd, context);
+      onStage("Calling Codex CLI", "Starting provider generation");
+      result = await generateViaCodex(promptBundle, model, body.cwd, context, runtime);
       model = model || "cli-default";
     } else if (provider.id === "opencode-cli") {
-      result = await generateViaOpencode(promptBundle, model, body.cwd, context);
-      model = model || "cli-default";
+      result = await generateViaOpencode(promptBundle, model, body.cwd, context, runtime);
+      model = result.resolvedModel || model || "server-default";
     } else if (provider.id === "openai-api") {
       const entry = config.providers.openai || {};
-      result = await generateViaOpenAI(promptBundle, entry, context);
+      result = await generateViaOpenAI(promptBundle, entry, context, runtime);
       model = entry.model || model;
     } else if (provider.id === "anthropic-api") {
       const entry = config.providers.anthropic || {};
-      result = await generateViaAnthropic(promptBundle, entry, context);
+      result = await generateViaAnthropic(promptBundle, entry, context, runtime);
       model = entry.model || model;
     } else {
       throw new Error("Provider does not support query generation");
     }
+
+    delete result.resolvedModel;
 
     const duration = Date.now() - startTime;
     debugLog("info", "Query generation completed", {
@@ -1093,6 +1647,86 @@ function deleteApiProviderConfig(providerId) {
   return getApiProviderStatus(PROVIDERS[providerId], config);
 }
 
+async function runGenerationJob(job, body) {
+  const runtime = {
+    signal: job.abortController.signal,
+    timeout: GENERATION_JOB_TIMEOUT_MS,
+    onStage(stage, detail) {
+      setGenerationJobStage(job, stage, detail);
+    },
+    setCancel(cancel) {
+      job.cancel = cancel;
+    }
+  };
+
+  try {
+    setGenerationJobStage(job, "Starting generation", `Using ${job.providerName}`);
+    const result = await generateQuery(body, runtime);
+    finalizeGenerationJob(job, "completed", {
+      stage: "Completed",
+      stageDetail: "Generated query is ready",
+      model: result.model || job.model,
+      result
+    });
+    appendGenerationJobEvent(job, "Completed: Generated query is ready");
+  } catch (error) {
+    if (isTerminalGenerationJobStatus(job.status)) {
+      return job;
+    }
+
+    if (error && error.name === "AbortError") {
+      finalizeGenerationJob(job, "cancelled", {
+        stage: "Cancelled",
+        stageDetail: error.message || "Generation cancelled",
+        error: ""
+      });
+      return job;
+    }
+
+    finalizeGenerationJob(job, "failed", {
+      stage: error && error.name === "TimeoutError" ? "Timed out" : "Failed",
+      stageDetail: String(error && error.message ? error.message : error),
+      error: String(error && error.message ? error.message : error)
+    });
+    appendGenerationJobEvent(job, `Failed: ${job.error}`, "error");
+  } finally {
+    job.cancel = undefined;
+  }
+
+  return job;
+}
+
+function startGenerationJob(body) {
+  const prompt = String(body.prompt || "").trim();
+  if (!prompt) {
+    throw new Error("Prompt is required");
+  }
+
+  const provider = PROVIDERS[body.providerId];
+  if (!provider) {
+    throw new Error("Unknown provider");
+  }
+
+  const job = createGenerationJob({
+    providerId: provider.id,
+    providerName: provider.name,
+    model: String(body.model || "").trim()
+  });
+
+  runGenerationJob(job, body).catch((error) => {
+    if (!isTerminalGenerationJobStatus(job.status)) {
+      finalizeGenerationJob(job, "failed", {
+        stage: "Failed",
+        stageDetail: String(error && error.message ? error.message : error),
+        error: String(error && error.message ? error.message : error)
+      });
+      appendGenerationJobEvent(job, `Failed: ${job.error}`, "error");
+    }
+  });
+
+  return job;
+}
+
 async function handleRequest(req, res) {
   if (req.method === "OPTIONS") {
     sendJson(res, 200, { ok: true });
@@ -1131,6 +1765,33 @@ async function handleRequest(req, res) {
       return;
     }
 
+    const generationJobMatch = url.pathname.match(/^\/v1\/generation-jobs\/([^/]+)$/);
+    if (generationJobMatch && req.method === "GET") {
+      const job = getGenerationJob(generationJobMatch[1]);
+      sendJson(res, 200, {
+        job: serializeGenerationJob(job)
+      });
+      return;
+    }
+
+    if (generationJobMatch && req.method === "DELETE") {
+      const job = getGenerationJob(generationJobMatch[1]);
+      await cancelGenerationJob(job, "Generation cancelled by the user");
+      sendJson(res, 200, {
+        job: serializeGenerationJob(job)
+      });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/generation-jobs") {
+      const body = await readRequestBody(req);
+      const job = startGenerationJob(body);
+      sendJson(res, 202, {
+        job: serializeGenerationJob(job)
+      });
+      return;
+    }
+
     const providerMatch = url.pathname.match(/^\/v1\/providers\/([^/]+)\/(api-key|login|browser-oauth)$/);
     if (providerMatch) {
       const providerId = providerMatch[1];
@@ -1164,34 +1825,55 @@ async function handleRequest(req, res) {
 
     if (req.method === "POST" && url.pathname === "/v1/generate-query") {
       const body = await readRequestBody(req);
-      const result = await generateQuery(body);
+      const result = await generateQuery(body, {
+        timeout: GENERATION_JOB_TIMEOUT_MS
+      });
       sendJson(res, 200, result);
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/v1/opencode/models") {
       try {
-        const opencodeUrl = process.env.OPENCODE_SERVER_URL || "http://127.0.0.1:4096";
-        const response = await fetchJson(`${opencodeUrl}/config/providers`);
+        const opencodeUrl = getOpencodeServerUrl();
+        const response = await fetchJson(`${opencodeUrl}/config/providers`, {
+          timeout: OPENCODE_REQUEST_TIMEOUT_MS
+        });
         
         // Extract models from the response
         const models = [];
+        const defaults = response.default || {};
         if (response.providers) {
           for (const provider of response.providers) {
             if (provider.models) {
               for (const [modelId, modelInfo] of Object.entries(provider.models)) {
                 models.push({
-                  id: modelId,
+                  id: `${provider.id}/${modelId}`,
                   providerId: provider.id,
+                  modelId,
                   name: modelInfo.name || modelId,
-                  family: modelInfo.family || "unknown"
+                  label: `${provider.name} / ${modelInfo.name || modelId}`,
+                  family: modelInfo.family || "unknown",
+                  isDefault: defaults[provider.id] === modelId
                 });
               }
             }
           }
         }
-        
-        sendJson(res, 200, { models });
+
+        models.sort((left, right) => {
+          if (left.isDefault && !right.isDefault) {
+            return -1;
+          }
+          if (!left.isDefault && right.isDefault) {
+            return 1;
+          }
+          return left.label.localeCompare(right.label);
+        });
+
+        sendJson(res, 200, {
+          serverUrl: opencodeUrl,
+          models
+        });
       } catch (error) {
         sendError(res, 500, error);
       }

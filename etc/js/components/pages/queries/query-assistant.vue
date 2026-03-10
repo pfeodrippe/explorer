@@ -59,6 +59,21 @@ npm run bridge</pre>
           </div>
         </div>
 
+        <div v-if="generationJob" class="assistant-job" :class="generationJobClass(generationJob)">
+          <div class="assistant-job-header">
+            <div class="assistant-job-stage">{{ generationJob.stage || generationJobStatusLabel(generationJob) }}</div>
+            <div class="assistant-job-meta">
+              {{ generationJob.providerName }}<span v-if="generationJob.model"> / {{ generationJob.model }}</span><span v-if="generationElapsedLabel"> / {{ generationElapsedLabel }}</span>
+            </div>
+          </div>
+          <div v-if="generationJob.stageDetail" class="assistant-job-detail">{{ generationJob.stageDetail }}</div>
+          <ul v-if="generationJobEventPreview.length" class="assistant-job-events">
+            <li v-for="event in generationJobEventPreview" :key="`${event.time}-${event.message}`">
+              {{ event.message }}
+            </li>
+          </ul>
+        </div>
+
         <div v-if="errorMessage" class="assistant-error">{{ errorMessage }}</div>
       </section>
 
@@ -186,10 +201,16 @@ npm run bridge</pre>
                   class="assistant-select">
                   <option value="">Default</option>
                   <option v-for="model in opencodeModels" :key="model.id" :value="model.id">
-                    {{ model.name }}
+                    {{ model.label || model.name }}
                   </option>
                 </select>
               </div>
+              <div v-if="selectedProvider.id === 'opencode-cli'" class="provider-help">
+                {{ opencodeProviderMessage(selectedProvider) }}
+              </div>
+              <pre
+                v-if="selectedProvider.id === 'opencode-cli' && selectedProvider.serverHealthy === false"
+                class="assistant-command assistant-command-small">opencode serve --port 4096</pre>
             </template>
 
             <template v-else>
@@ -289,10 +310,11 @@ const apiKey = ref("");
 const apiModel = ref("");
 const knownSymbols = ref([]);
 const opencodeModels = ref([]);
-const selectedOpencodeModel = ref(localStorage.getItem("flecs.ai.opencodeModel") || "");
+const selectedOpencodeModel = ref(localStorage.getItem(OPENCODE_MODEL_KEY) || "");
+const generationJob = ref(undefined);
 let authSessionPollTimer = 0;
+let generationJobPollTimer = 0;
 let messageId = 0;
-let generationController = undefined;
 
 const selectedProvider = computed(() => {
   return providers.value.find((provider) => provider.id === selectedProviderId.value);
@@ -311,6 +333,20 @@ const selectedProviderAuthSession = computed(() => {
 const agentHasMessages = computed(() => conversation.value.length > 0);
 const agentCanStop = computed(() => {
   return generateLoading.value || Boolean(awaitingExecution.value) || agentRunning.value;
+});
+
+const generationElapsedLabel = computed(() => {
+  if (!generationJob.value) {
+    return "";
+  }
+  return formatElapsed(generationJob.value.elapsedMs || 0);
+});
+
+const generationJobEventPreview = computed(() => {
+  if (!generationJob.value || !Array.isArray(generationJob.value.events)) {
+    return [];
+  }
+  return generationJob.value.events.slice(-4).reverse();
 });
 
 const canGenerate = computed(() => {
@@ -345,6 +381,9 @@ function providerStatusLabel(provider) {
   if (provider.status === "missing") {
     return "Missing";
   }
+  if (provider.status === "needs_server") {
+    return "Start Server";
+  }
   if (provider.status === "needs_config") {
     return "Configure";
   }
@@ -372,11 +411,71 @@ function providerHelpText(provider) {
     return "";
   }
 
+  if (provider.id === "opencode-cli") {
+    return "Explorer uses the local OpenCode CLI and server for generation. Keep the bridge and the OpenCode server running for the fastest feedback.";
+  }
+
   if (provider.supportsBrowserOauth) {
     return "Explorer can start the provider browser sign-in flow through the local bridge and track completion. Terminal launch remains available as a fallback.";
   }
 
   return "Explorer uses the local CLI for generation. This provider still needs its native terminal login flow.";
+}
+
+function opencodeProviderMessage(provider) {
+  if (!provider) {
+    return "";
+  }
+
+  if (provider.serverHealthy) {
+    return provider.serverMessage || "OpenCode server is reachable.";
+  }
+
+  return provider.serverMessage || "OpenCode is signed in, but the local server is not reachable yet.";
+}
+
+function generationJobStatusLabel(job) {
+  if (!job) {
+    return "";
+  }
+
+  if (job.status === "completed") {
+    return "Completed";
+  }
+  if (job.status === "failed") {
+    return "Failed";
+  }
+  if (job.status === "cancelled") {
+    return "Cancelled";
+  }
+  if (job.status === "queued") {
+    return "Queued";
+  }
+  return "Running";
+}
+
+function generationJobClass(job) {
+  return {
+    "assistant-job-running": job && (job.status === "queued" || job.status === "running"),
+    "assistant-job-completed": job && job.status === "completed",
+    "assistant-job-failed": job && (job.status === "failed" || job.status === "cancelled")
+  };
+}
+
+function formatElapsed(value) {
+  const elapsedMs = Number(value || 0);
+  if (elapsedMs < 1000) {
+    return "<1s";
+  }
+
+  const seconds = elapsedMs / 1000;
+  if (seconds < 60) {
+    return `${seconds.toFixed(1)}s`;
+  }
+
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.round(seconds % 60);
+  return `${minutes}m ${remainder}s`;
 }
 
 function modelPlaceholder(providerId) {
@@ -438,15 +537,41 @@ function clearConversation() {
   agentStopRequested.value = false;
 }
 
-function stopAgent() {
+function hasActiveGenerationJob(job) {
+  return Boolean(job && (job.status === "queued" || job.status === "running"));
+}
+
+function stopGenerationJobPolling() {
+  if (generationJobPollTimer) {
+    window.clearTimeout(generationJobPollTimer);
+    generationJobPollTimer = 0;
+  }
+}
+
+async function stopAgent() {
   agentStopRequested.value = true;
   agentRunning.value = false;
+  stopGenerationJobPolling();
 
-  if (generationController) {
-    generationController.abort();
-    generationController = undefined;
+  if (hasActiveGenerationJob(generationJob.value)) {
+    try {
+      const reply = await bridgeRequest(`/v1/generation-jobs/${generationJob.value.id}`, {
+        method: "DELETE"
+      });
+      generationJob.value = reply.job;
+      generateLoading.value = false;
+      agentStatusMessage.value = awaitingExecution.value
+        ? "Agent stopped. Waiting for the current explorer run to finish."
+        : (reply.job.stageDetail || "Agent stopped.");
+    } catch (error) {
+      generateLoading.value = false;
+      errorMessage.value = String(error.message || error);
+      agentStatusMessage.value = "Could not stop the current generation cleanly.";
+    }
+    return;
   }
 
+  generateLoading.value = false;
   agentStatusMessage.value = awaitingExecution.value
     ? "Agent stopped. Waiting for the current explorer run to finish."
     : "Agent stopped.";
@@ -525,14 +650,93 @@ async function bridgeRequest(path, options = {}) {
   return payload;
 }
 
+function applyGenerationJob(job) {
+  generationJob.value = job;
+  generateLoading.value = hasActiveGenerationJob(job);
+
+  if (hasActiveGenerationJob(job)) {
+    agentStatusMessage.value = job.stageDetail || job.stage || "Generating query...";
+  }
+}
+
+async function finalizeGenerationJob(job) {
+  applyGenerationJob(job);
+
+  if (!job) {
+    return;
+  }
+
+  if (job.status === "completed" && job.result) {
+    result.value = job.result;
+    appendConversation("assistant", formatAssistantMessage(job.result), {
+      query: job.result.query
+    });
+
+    if (autoRun.value && job.result.query) {
+      awaitingExecution.value = {
+        query: job.result.query,
+        seq: props.query_result_state ? props.query_result_state.seq : 0
+      };
+      agentStatusMessage.value = `Running generated query in explorer (attempt ${agentAttempt.value}/${MAX_AGENT_ATTEMPTS})`;
+      emit("run", job.result.query);
+    } else {
+      agentRunning.value = false;
+      agentStatusMessage.value = "Generated query ready for manual run.";
+    }
+    return;
+  }
+
+  agentRunning.value = false;
+
+  if (job.status === "cancelled") {
+    agentStatusMessage.value = awaitingExecution.value
+      ? "Agent stopped. Waiting for the current explorer run to finish."
+      : (job.stageDetail || "Agent stopped.");
+    return;
+  }
+
+  if (job.status === "failed") {
+    errorMessage.value = job.error || job.stageDetail || "Generation failed";
+    agentStatusMessage.value = job.stageDetail || "Agent stopped due to a generation error.";
+  }
+}
+
+async function pollGenerationJob(jobId) {
+  stopGenerationJobPolling();
+
+  if (!jobId) {
+    return;
+  }
+
+  try {
+    const reply = await bridgeRequest(`/v1/generation-jobs/${jobId}`);
+    const job = reply.job;
+
+    if (hasActiveGenerationJob(job)) {
+      applyGenerationJob(job);
+      generationJobPollTimer = window.setTimeout(() => {
+        pollGenerationJob(jobId);
+      }, 400);
+      return;
+    }
+
+    await finalizeGenerationJob(job);
+  } catch (error) {
+    generateLoading.value = false;
+    agentRunning.value = false;
+    errorMessage.value = String(error.message || error);
+    agentStatusMessage.value = "Could not read generation status.";
+  }
+}
+
 async function requestAgentQuery(executionFeedback) {
   if (!selectedProvider.value) {
     return;
   }
 
+  stopGenerationJobPolling();
   generateLoading.value = true;
   errorMessage.value = "";
-  generationController = new AbortController();
 
   try {
     const requestBody = {
@@ -554,39 +758,23 @@ async function requestAgentQuery(executionFeedback) {
       requestBody.model = selectedOpencodeModel.value;
     }
 
-    const nextResult = await bridgeRequest("/v1/generate-query", {
+    const reply = await bridgeRequest("/v1/generation-jobs", {
       method: "POST",
-      signal: generationController.signal,
       body: JSON.stringify(requestBody)
     });
 
-    result.value = nextResult;
-    appendConversation("assistant", formatAssistantMessage(nextResult), {
-      query: nextResult.query
-    });
+    applyGenerationJob(reply.job);
 
-    if (autoRun.value && nextResult.query) {
-      awaitingExecution.value = {
-        query: nextResult.query,
-        seq: props.query_result_state ? props.query_result_state.seq : 0
-      };
-      agentStatusMessage.value = `Running generated query in explorer (attempt ${agentAttempt.value}/${MAX_AGENT_ATTEMPTS})`;
-      emit("run", nextResult.query);
+    if (hasActiveGenerationJob(reply.job)) {
+      pollGenerationJob(reply.job.id);
     } else {
-      agentRunning.value = false;
-      agentStatusMessage.value = "Generated query ready for manual run.";
+      await finalizeGenerationJob(reply.job);
     }
   } catch (error) {
-    if (error && error.name === "AbortError") {
-      return;
-    }
-
+    generateLoading.value = false;
     agentRunning.value = false;
     errorMessage.value = String(error.message || error);
     agentStatusMessage.value = "Agent stopped due to a generation error.";
-  } finally {
-    generationController = undefined;
-    generateLoading.value = false;
   }
 }
 
@@ -615,6 +803,8 @@ async function refreshBridge() {
     // Load OpenCode models if OpenCode CLI is selected
     if (selectedProvider.value && selectedProvider.value.id === "opencode-cli") {
       await loadOpencodeModels();
+    } else {
+      opencodeModels.value = [];
     }
   } catch (error) {
     bridgeHealthy.value = false;
@@ -630,6 +820,12 @@ async function loadOpencodeModels() {
   try {
     const reply = await bridgeRequest("/v1/opencode/models");
     opencodeModels.value = reply.models || [];
+
+    if (selectedOpencodeModel.value &&
+      !opencodeModels.value.some((model) => model.id === selectedOpencodeModel.value)) {
+      selectedOpencodeModel.value = "";
+      persistOpencodeModel();
+    }
   } catch (error) {
     opencodeModels.value = [];
   }
@@ -850,6 +1046,7 @@ async function generateQuery() {
   agentAttempt.value = 1;
   errorMessage.value = "";
   result.value = undefined;
+  generationJob.value = undefined;
   appendConversation("user", prompt.value);
   agentStatusMessage.value = "Generating initial query...";
 
@@ -895,9 +1092,15 @@ async function copyResult() {
   }
 }
 
-watch(selectedProviderId, () => {
+watch(selectedProviderId, async () => {
   persistProviderId();
   updateApiForm();
+
+  if (selectedProvider.value && selectedProvider.value.id === "opencode-cli") {
+    await loadOpencodeModels();
+  } else {
+    opencodeModels.value = [];
+  }
 });
 
 watch(autoRun, () => {
@@ -977,9 +1180,12 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stopAuthSessionPolling();
-  if (generationController) {
-    generationController.abort();
-    generationController = undefined;
+  stopGenerationJobPolling();
+
+  if (hasActiveGenerationJob(generationJob.value)) {
+    bridgeRequest(`/v1/generation-jobs/${generationJob.value.id}`, {
+      method: "DELETE"
+    }).catch(() => {});
   }
 });
 </script>
@@ -1094,6 +1300,60 @@ div.assistant-status-agent {
 div.assistant-status-error,
 div.assistant-error {
   color: #ff8e8e;
+}
+
+div.assistant-job {
+  margin-top: 0.75rem;
+  padding: 0.7rem;
+  border-radius: var(--border-radius-medium);
+  background-color: var(--bg-pane);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+}
+
+div.assistant-job-running {
+  box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.28);
+}
+
+div.assistant-job-completed {
+  box-shadow: inset 0 0 0 1px rgba(88, 214, 141, 0.28);
+}
+
+div.assistant-job-failed {
+  box-shadow: inset 0 0 0 1px rgba(255, 142, 142, 0.28);
+}
+
+div.assistant-job-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: baseline;
+}
+
+div.assistant-job-stage {
+  color: var(--primary-text);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+div.assistant-job-meta,
+div.assistant-job-detail {
+  color: var(--secondary-text);
+  font-size: 0.8rem;
+}
+
+div.assistant-job-detail {
+  margin-top: 0.35rem;
+}
+
+ul.assistant-job-events {
+  margin: 0.55rem 0 0;
+  padding-left: 1rem;
+  color: var(--secondary-text);
+  font-size: 0.78rem;
+}
+
+ul.assistant-job-events li + li {
+  margin-top: 0.2rem;
 }
 
 div.provider-grid {

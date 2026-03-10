@@ -29,6 +29,39 @@ function buildProvider(overrides = {}) {
   };
 }
 
+function buildJob(overrides = {}) {
+  return {
+    id: "job-1",
+    providerId: "claude-cli",
+    providerName: "Claude CLI",
+    model: "cli-default",
+    status: "running",
+    stage: "Waiting for model",
+    stageDetail: "Generating query",
+    startedAt: "2026-03-10T00:00:00.000Z",
+    updatedAt: "2026-03-10T00:00:00.000Z",
+    completedAt: "",
+    elapsedMs: 1200,
+    canCancel: true,
+    result: undefined,
+    error: "",
+    events: [
+      {
+        time: "2026-03-10T00:00:00.000Z",
+        level: "info",
+        message: "Waiting for model: Generating query"
+      }
+    ],
+    ...overrides
+  };
+}
+
+async function waitForJobPolling() {
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  await flushPromises();
+  await flushPromises();
+}
+
 function mountAssistant(queryUpdate = jest.fn()) {
   return mount(QueryAssistant, {
     global: {
@@ -80,6 +113,7 @@ describe("query-assistant.vue", () => {
 
   test("loads providers and applies a generated query", async () => {
     const queryUpdate = jest.fn();
+    let jobPollCount = 0;
     global.fetch = jest.fn((url, options = {}) => {
       if (url.endsWith("/v1/health")) {
         return mockResponse({
@@ -94,20 +128,38 @@ describe("query-assistant.vue", () => {
         });
       }
 
-      if (url.endsWith("/v1/generate-query")) {
+      if (url.endsWith("/v1/generation-jobs") && options.method === "POST") {
         return mockResponse({
-          query: "Position, Velocity",
-          reasoning: "Matches moving entities",
-          warnings: [],
-          provider: "claude-cli",
-          providerName: "Claude CLI",
-          model: "cli-default"
+          job: buildJob()
         });
       }
 
-      if (url.endsWith("/v1/providers/claude-cli/login")) {
+      if (url.endsWith("/v1/generation-jobs/job-1")) {
+        jobPollCount += 1;
         return mockResponse({
-          launched: true
+          job: buildJob({
+            status: "completed",
+            stage: "Completed",
+            stageDetail: "Generated query is ready",
+            completedAt: "2026-03-10T00:00:01.000Z",
+            elapsedMs: 1800,
+            canCancel: false,
+            result: {
+              query: "Position, Velocity",
+              reasoning: "Matches moving entities",
+              warnings: [],
+              provider: "claude-cli",
+              providerName: "Claude CLI",
+              model: "cli-default"
+            },
+            events: [
+              {
+                time: "2026-03-10T00:00:01.000Z",
+                level: "info",
+                message: "Completed: Generated query is ready"
+              }
+            ]
+          })
         });
       }
 
@@ -129,11 +181,11 @@ describe("query-assistant.vue", () => {
     expect(wrapper.text()).toContain("Generate and Run Query");
 
     await findButton(wrapper, "Generate and Run Query").trigger("click");
-    await flushPromises();
-    await flushPromises();
+    await waitForJobPolling();
 
     expect(wrapper.text()).toContain("Position, Velocity");
     expect(wrapper.emitted().run[0]).toEqual(["Position, Velocity"]);
+    expect(jobPollCount).toBeGreaterThan(0);
 
     await findButton(wrapper, "Apply To Editor").trigger("click");
 
@@ -142,6 +194,7 @@ describe("query-assistant.vue", () => {
   });
 
   test("can disable auto run and run manually", async () => {
+    let jobId = 0;
     global.fetch = jest.fn((url, options = {}) => {
       if (url.endsWith("/v1/health")) {
         return mockResponse({
@@ -156,14 +209,34 @@ describe("query-assistant.vue", () => {
         });
       }
 
-      if (url.endsWith("/v1/generate-query")) {
+      if (url.endsWith("/v1/generation-jobs") && options.method === "POST") {
+        jobId += 1;
         return mockResponse({
-          query: "Mass",
-          reasoning: "Matches the demo component",
-          warnings: [],
-          provider: "claude-cli",
-          providerName: "Claude CLI",
-          model: "cli-default"
+          job: buildJob({
+            id: `job-${jobId}`
+          })
+        });
+      }
+
+      if (url.endsWith("/v1/generation-jobs/job-1")) {
+        return mockResponse({
+          job: buildJob({
+            id: "job-1",
+            status: "completed",
+            stage: "Completed",
+            stageDetail: "Generated query is ready",
+            completedAt: "2026-03-10T00:00:01.000Z",
+            elapsedMs: 1500,
+            canCancel: false,
+            result: {
+              query: "Mass",
+              reasoning: "Matches the demo component",
+              warnings: [],
+              provider: "claude-cli",
+              providerName: "Claude CLI",
+              model: "cli-default"
+            }
+          })
         });
       }
 
@@ -179,8 +252,7 @@ describe("query-assistant.vue", () => {
     expect(wrapper.text()).toContain("Generate Query Only");
     await wrapper.find("#assistant-prompt").setValue("find masses");
     await findButton(wrapper, "Generate Query Only").trigger("click");
-    await flushPromises();
-    await flushPromises();
+    await waitForJobPolling();
 
     expect(wrapper.emitted().run).toBeUndefined();
 
@@ -282,6 +354,69 @@ describe("query-assistant.vue", () => {
     expect(wrapper.text()).toContain("Signed in with Claude");
   });
 
+  test("loads OpenCode models when the provider is selected", async () => {
+    global.fetch = jest.fn((url, options = {}) => {
+      if (url.endsWith("/v1/health")) {
+        return mockResponse({
+          ok: true,
+          configPath: "/tmp/flecs-ai-bridge.json"
+        });
+      }
+
+      if (url.endsWith("/v1/providers")) {
+        return mockResponse({
+          providers: [
+            buildProvider(),
+            buildProvider({
+              id: "opencode-cli",
+              name: "OpenCode CLI",
+              supportsBrowserOauth: false,
+              status: "ready",
+              ready: true,
+              message: "2 configured credentials",
+              serverHealthy: true,
+              serverMessage: "OpenCode server reachable at http://127.0.0.1:4096"
+            })
+          ]
+        });
+      }
+
+      if (url.endsWith("/v1/opencode/models")) {
+        return mockResponse({
+          models: [
+            {
+              id: "github-copilot/gpt-5-mini",
+              providerId: "github-copilot",
+              modelId: "gpt-5-mini",
+              name: "GPT-5 Mini",
+              label: "GitHub Copilot / GPT-5 Mini",
+              family: "gpt-mini",
+              isDefault: false
+            }
+          ]
+        });
+      }
+
+      return mockResponse({ error: "not found" }, false, 404);
+    });
+
+    const wrapper = mountAssistant();
+
+    await flushPromises();
+    await flushPromises();
+
+    const openCodeCard = wrapper.findAll("button").find((node) => node.text().includes("OpenCode CLI"));
+    await openCodeCard.trigger("click");
+    await flushPromises();
+    await flushPromises();
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:27891/v1/opencode/models",
+      expect.any(Object)
+    );
+    expect(wrapper.text()).toContain("GitHub Copilot / GPT-5 Mini");
+  });
+
   test("retries automatically when explorer rejects the generated query", async () => {
     const generationReplies = [
       {
@@ -301,6 +436,7 @@ describe("query-assistant.vue", () => {
         model: "cli-default"
       }
     ];
+    let jobCounter = 0;
 
     global.fetch = jest.fn((url, options = {}) => {
       if (url.endsWith("/v1/health")) {
@@ -316,8 +452,43 @@ describe("query-assistant.vue", () => {
         });
       }
 
-      if (url.endsWith("/v1/generate-query")) {
-        return mockResponse(generationReplies.shift());
+      if (url.endsWith("/v1/generation-jobs") && options.method === "POST") {
+        jobCounter += 1;
+        return mockResponse({
+          job: buildJob({
+            id: `job-${jobCounter}`
+          })
+        });
+      }
+
+      if (url.endsWith("/v1/generation-jobs/job-1")) {
+        return mockResponse({
+          job: buildJob({
+            id: "job-1",
+            status: "completed",
+            stage: "Completed",
+            stageDetail: "Generated query is ready",
+            completedAt: "2026-03-10T00:00:01.000Z",
+            elapsedMs: 1200,
+            canCancel: false,
+            result: generationReplies[0]
+          })
+        });
+      }
+
+      if (url.endsWith("/v1/generation-jobs/job-2")) {
+        return mockResponse({
+          job: buildJob({
+            id: "job-2",
+            status: "completed",
+            stage: "Completed",
+            stageDetail: "Generated query is ready",
+            completedAt: "2026-03-10T00:00:02.000Z",
+            elapsedMs: 1300,
+            canCancel: false,
+            result: generationReplies[1]
+          })
+        });
       }
 
       return mockResponse({ error: "not found" }, false, 404);
@@ -330,8 +501,7 @@ describe("query-assistant.vue", () => {
 
     await wrapper.find("#assistant-prompt").setValue("Find all entities with position");
     await findButton(wrapper, "Generate and Run Query").trigger("click");
-    await flushPromises();
-    await flushPromises();
+    await waitForJobPolling();
 
     expect(wrapper.emitted().run[0]).toEqual(["Position"]);
 
@@ -345,10 +515,9 @@ describe("query-assistant.vue", () => {
         }
       }
     });
-    await flushPromises();
-    await flushPromises();
+    await waitForJobPolling();
 
-    const generationCalls = global.fetch.mock.calls.filter(([url]) => url.endsWith("/v1/generate-query"));
+    const generationCalls = global.fetch.mock.calls.filter(([url]) => url.endsWith("/v1/generation-jobs"));
     expect(generationCalls).toHaveLength(2);
     expect(generationCalls[1][1].body).toContain("unresolved identifier 'Position'");
     expect(wrapper.emitted().run[1]).toEqual(["game.Position"]);
